@@ -182,7 +182,7 @@ Tensor mkldnn_reorder_conv2d_weight(
       dilation_expanded,
       groups,
       ideep::algorithm::convolution_direct,
-      ideep::prop_kind::forward,
+      ideep::prop_kind::forward_inference,
       w.get_data_type(),
       src_dims,
       ideep::attr_t(),
@@ -229,7 +229,7 @@ Tensor mkldnn_reorder_conv3d_weight(
       dilation_expanded,
       groups,
       ideep::algorithm::convolution_direct,
-      ideep::prop_kind::forward,
+      ideep::prop_kind::forward_inference,
       w.get_data_type(),
       src_dims,
       ideep::attr_t(),
@@ -273,7 +273,8 @@ static Tensor mkldnn_reorder_linear_weight(
       {out_features, in_features},
       input_size,
       /* weight dtype */ dtype,
-      /* src dtype */ dtype);
+      /* src dtype */ dtype,
+      ideep::prop_kind::forward_inference);
   ideep::tensor result;
   result.init(packed_desc);
   result.feed_from(w);
@@ -524,12 +525,12 @@ static Tensor get_mkldnn_serialized_md(const Tensor& self) {
   auto packed_w_desc = packed_w.get_desc();
   std::vector<uint8_t> serialized_wei_desc;
 
-#if IDEEP_PREREQ(3, 4, 1, 2)
+#if DNNL_PREREQ(3, 4, 1)
   serialized_wei_desc = packed_w_desc.get_blob();
 #else
-      TORCH_CHECK(false, "Unexpected IDeep version to do weight serialization.");
+      TORCH_CHECK(false, "Unexpected oneDNN version to do weight serialization.");
 #endif
-  Tensor serialized_md = at::from_blob((void*)serialized_wei_desc.data(), {(int64_t)serialized_wei_desc.size()}, at::TensorOptions(at::kByte));
+  Tensor serialized_md = at::from_blob((void*)serialized_wei_desc.data(), {static_cast<int64_t>(serialized_wei_desc.size())}, at::TensorOptions(at::kByte));
   auto res = at::empty_like(serialized_md);
   // serialized_md shares the buffer with serialized_wei_desc,
   // which will be released outside of this function thus invalidating the buffer of serialized_md.

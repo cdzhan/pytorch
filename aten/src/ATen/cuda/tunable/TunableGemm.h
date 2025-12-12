@@ -20,6 +20,7 @@
 #include <c10/util/Float8_e4m3fnuz.h>
 #include <c10/util/Float8_e5m2.h>
 #include <c10/util/Float8_e5m2fnuz.h>
+#include <c10/util/Float8_e8m0fnu.h>
 #include <c10/util/StringUtil.h>
 #include <fmt/printf.h>
 
@@ -94,10 +95,14 @@ class DefaultScaledGemmOp : public Callable<ScaledGemmParams<T>> {
           params->a_scale_ptr,
           params->lda,
           params->a_dtype,
+          params->a_scale_dtype,
+          params->a_scaling_type,
           params->b,
           params->b_scale_ptr,
           params->ldb,
           params->b_dtype,
+          params->b_scale_dtype,
+          params->b_scaling_type,
           params->bias_ptr,
           params->bias_dtype,
           params->c,
@@ -105,7 +110,7 @@ class DefaultScaledGemmOp : public Callable<ScaledGemmParams<T>> {
           params->ldc,
           params->c_dtype,
           params->use_fast_accum,
-          params->use_rowwise);
+          std::nullopt /* alpha */);
       return OK;
     }
 };
@@ -142,7 +147,11 @@ inline const char* TypeName(T v) {
 
 template <>
 inline const char* TypeName(float v) {
-  return "float";
+  if (at::globalContext().allowTF32CuBLAS()) {
+    return "tf32";
+  } else {
+    return "float";
+  }
 }
 
 template <>
@@ -178,6 +187,11 @@ inline const char* TypeName(Float8_e4m3fnuz v) {
 template <>
 inline const char* TypeName(Float8_e5m2fnuz v) {
   return "Float8_e5m2fnuz";
+}
+
+template <>
+inline const char* TypeName(Float8_e8m0fnu v) {
+  return "Float8_e8m0fnu";
 }
 
 template <>

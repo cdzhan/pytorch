@@ -7,7 +7,7 @@ import logging
 import os
 import pkgutil
 import unittest
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 from torch._utils_internal import get_file_path_2  # @manual
@@ -59,6 +59,7 @@ class TestPublicBindings(TestCase):
         #
         #   {elem for elem in dir(torch._C) if not elem.startswith("_")}
         torch_C_allowlist_superset = {
+            "AcceleratorError",
             "AggregationType",
             "AliasDb",
             "AnyType",
@@ -122,6 +123,7 @@ class TestPublicBindings(TestCase):
             "FutureType",
             "Generator",
             "GeneratorType",
+            "GreenContext",
             "get_autocast_cpu_dtype",
             "get_autocast_dtype",
             "get_autocast_ipu_dtype",
@@ -356,6 +358,7 @@ class TestPublicBindings(TestCase):
             "torch.testing._internal.distributed.rpc.tensorpipe_rpc_agent_test_fixture",
             "torch.testing._internal.distributed.rpc_utils",
             "torch._inductor.codegen.cuda.cuda_template",
+            "torch._inductor.codegen.cutedsl._cutedsl_utils",
             "torch._inductor.codegen.cuda.gemm_template",
             "torch._inductor.codegen.cpp_template",
             "torch._inductor.codegen.cpp_gemm_template",
@@ -511,7 +514,7 @@ class TestPublicBindings(TestCase):
                             "does not have `__all__` defined"
                         )
                         fix_is_public = (
-                            f"remove it from the modules's (`{modname}`) `__all__`"
+                            f"remove it from the modules' (`{modname}`) `__all__`"
                             if is_all
                             else f"either define a `__all__` for `{modname}` or add a `_` at the beginning of the name"
                         )
@@ -521,7 +524,7 @@ class TestPublicBindings(TestCase):
                             f"it is not inside the module's (`{modname}`) `__all__`"
                         )
                         fix_is_public = (
-                            f"add it from the modules's (`{modname}`) `__all__`"
+                            f"add it from the modules' (`{modname}`) `__all__`"
                         )
                     if looks_public:
                         why_looks_public = (

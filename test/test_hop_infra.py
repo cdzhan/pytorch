@@ -1,4 +1,5 @@
 # Owner(s): ["module: higher order operators"]
+import copy
 import importlib
 import pkgutil
 
@@ -62,6 +63,7 @@ class TestHOPInfra(TestCase):
         FIXME_ALLOWLIST = {
             "autograd_function_apply",
             "run_with_rng_state",
+            "graphsafe_run_with_rng_state",
             "map_impl",
             "_export_tracepoint",
             "run_and_save_rng_state",
@@ -85,6 +87,19 @@ class TestHOPInfra(TestCase):
         stuff = torch._higher_order_ops.__all__
         for attr in stuff:
             getattr(torch._higher_order_ops, attr)
+
+    def test_hop_deepcopy_preserves_identity(self):
+        """HigherOrderOperators should be singletons - deepcopy should return the same object"""
+        from torch._ops import _higher_order_ops
+
+        for name, hop in _higher_order_ops.items():
+            copied_hop = copy.deepcopy(hop)
+            self.assertIs(
+                hop,
+                copied_hop,
+                f"deepcopy of HigherOrderOperator '{name}' should return the same object (singleton pattern)",
+            )
+            self.assertEqual(id(hop), id(copied_hop))
 
 
 if __name__ == "__main__":

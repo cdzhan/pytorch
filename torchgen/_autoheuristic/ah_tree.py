@@ -7,8 +7,8 @@ from sklearn.tree import _tree  # type: ignore[import-untyped]
 class DecisionTreeNode:
     def __init__(
         self,
-        feature: Optional[str] = None,
-        threshold: Optional[float] = None,
+        feature: str | None = None,
+        threshold: float | None = None,
         left: Optional["DecisionTreeNode"] = None,
         right: Optional["DecisionTreeNode"] = None,
         class_probs: Any = None,
@@ -208,9 +208,9 @@ class DecisionTree:
                 if name in dummy_col_2_col_val:
                     (orig_name, value) = dummy_col_2_col_val[name]
                     predicate = f"{indent}if str(context.get_value('{orig_name}')) != '{value}':"
-                    assert (
-                        threshold == 0.5
-                    ), f"expected threshold to be 0.5 but is {threshold}"
+                    assert threshold == 0.5, (
+                        f"expected threshold to be 0.5 but is {threshold}"
+                    )
                 else:
                     predicate = (
                         f"{indent}if context.get_value('{name}') <= {threshold}:"

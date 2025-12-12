@@ -1,7 +1,7 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import contextlib
-from typing import cast, Optional
+from typing import cast
 
 import torch
 import torch._prims_common as utils
@@ -11,12 +11,13 @@ from torch import Tensor
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
-from torch.distributed.tensor._ops._embedding_ops import _MaskPartial
+from torch.distributed.tensor._ops._embedding_ops import MaskPartial
 from torch.distributed.tensor._ops._math_ops import (
     _skip_dim,
     Reduction,
     replicate_reduction_dims,
 )
+from torch.distributed.tensor._ops.utils import normalize_dim
 from torch.distributed.tensor.placement_types import Placement
 
 
@@ -111,7 +112,7 @@ def _propagate_tensor_meta(
     kwargs: dict[str, object],
 ) -> TensorMeta:
     op_info = DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
-    tensor_meta = DTensor._op_dispatcher.sharding_propagator._propagate_tensor_meta(
+    tensor_meta = DTensor._op_dispatcher.sharding_propagator.propagate_tensor_meta(
         op_info.schema
     )
     if isinstance(tensor_meta, TensorMeta):
@@ -125,13 +126,12 @@ def _propagate_tensor_meta(
 # NOTE: The implementation follows torch._decomp.decomposition._log_softmax,
 # with all_reduce manually inserted to perform distributed computation.
 def _log_softmax(x, dim, half_to_float, mesh, mesh_dim):
-    x = x.contiguous()
     if half_to_float:
         assert x.dtype == torch.half
     computation_dtype, result_dtype = utils.elementwise_dtypes(
         x, type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
     )
-    x = x.to(computation_dtype)
+    x = x.to(dtype=computation_dtype, memory_format=torch.contiguous_format)
     if x.numel() == 0:
         shifted = x
     else:
@@ -161,6 +161,7 @@ def _log_softmax_handler(
     half_to_float = cast(bool, args[2])
 
     spec = x._spec
+    dim = normalize_dim(dim, x.dim())
     mesh_dim = _find_all_reduce_mesh_dim(spec.placements, dim)
 
     output_tensor_meta = _propagate_tensor_meta(op_call, args, kwargs)
@@ -173,9 +174,12 @@ def _log_softmax_handler(
         tensor_meta=output_tensor_meta,
     )
 
+    # pyrefly: ignore [bad-argument-type]
     return DTensor(
+        # pyrefly: ignore [bad-argument-count]
         res,
         res_spec,
+        # pyrefly: ignore [unexpected-keyword]
         requires_grad=res.requires_grad,
     )
 
@@ -197,8 +201,8 @@ def _log_softmax_backward_handler(
 def _nll_loss_forward(
     x: Tensor,
     target: Tensor,
-    weight: Optional[Tensor],
-    local_weight: Optional[Tensor],
+    weight: Tensor | None,
+    local_weight: Tensor | None,
     reduction: int,
     ignore_index: int,
     input_shape: torch.Size,
@@ -232,7 +236,7 @@ def _nll_loss_forward(
 
     # The following code block is a distributed version of
     # result = -torch.gather(self, channel_dim, safe_target_).squeeze(channel_dim)
-    partial_placement = _MaskPartial(offset_shape=input_shape, offset_dim=channel_dim)
+    partial_placement = MaskPartial(offset_shape=input_shape, offset_dim=channel_dim)
     safe_target_partial_ = partial_placement._partition_value(
         safe_target_, mesh, mesh_dim
     )
@@ -250,6 +254,7 @@ def _nll_loss_forward(
     if weight is not None:
         new_shape = list(x.shape)
         new_shape[channel_dim] = -1
+        # pyrefly: ignore [unbound-name]
         w = w.expand(new_shape)
         wsum = torch.gather(w, channel_dim, safe_target_).squeeze(channel_dim)
         wsum = torch.where(target != ignore_index, wsum, 0)
@@ -307,7 +312,9 @@ def _nll_loss_forward_handler(
         output_placements = all_replicate_placements
 
     # tensor inputs to _propagate_tensor_meta need to be DTensors
+    # pyrefly: ignore [bad-assignment]
     args = list(args)
+    # pyrefly: ignore [unsupported-operation]
     args[1], args[2] = target, weight
     output_tensor_meta = _propagate_tensor_meta(op_call, tuple(args), kwargs)
 
@@ -326,9 +333,12 @@ def _nll_loss_forward_handler(
     out_spec = DTensorSpec(spec.mesh, output_placements, tensor_meta=output_tensor_meta)
 
     return (
+        # pyrefly: ignore [bad-argument-type]
         DTensor(
+            # pyrefly: ignore [bad-argument-count]
             result,
             out_spec,
+            # pyrefly: ignore [unexpected-keyword]
             requires_grad=result.requires_grad,
         ),
         total_weight,
@@ -346,7 +356,7 @@ def _nll_loss_and_log_softmax_backward(
     grad_output: Tensor,
     x: Tensor,
     target: Tensor,
-    weight: Optional[Tensor],
+    weight: Tensor | None,
     reduction: int,
     ignore_index: int,
     total_weight: Tensor,
@@ -365,7 +375,7 @@ def _nll_loss_and_log_softmax_backward(
 
     # The following code block is a distributed version of
     # grad_input = torch.scatter(grad_input, channel_dim, safe_target, -1.0)
-    partial_placement = _MaskPartial(offset_shape=input_shape, offset_dim=channel_dim)
+    partial_placement = MaskPartial(offset_shape=input_shape, offset_dim=channel_dim)
     safe_target = safe_target.squeeze(channel_dim).flatten()
     masked_safe_target = partial_placement._partition_value(safe_target, mesh, mesh_dim)
     # only update grad_input to -1 if not masked
@@ -438,8 +448,11 @@ def _nll_loss_backward_handler(
         weight = _cast_to_dtensor(weight, all_replicate_placements, spec.mesh)
 
     # tensor inputs to _propagate_tensor_meta need to be DTensors
+    # pyrefly: ignore [bad-assignment]
     args = list(args)
+    # pyrefly: ignore [unsupported-operation]
     args[2], args[3] = target, weight
+    # pyrefly: ignore [unsupported-operation]
     args[6] = _cast_to_dtensor(total_weight, all_replicate_placements, spec.mesh)
     output_tensor_meta = _propagate_tensor_meta(op_call, tuple(args), kwargs)
 
@@ -463,9 +476,12 @@ def _nll_loss_backward_handler(
         tensor_meta=output_tensor_meta,
     )
 
+    # pyrefly: ignore [bad-argument-type]
     return DTensor(
+        # pyrefly: ignore [bad-argument-count]
         result,
         out_spec,
+        # pyrefly: ignore [unexpected-keyword]
         requires_grad=result.requires_grad,
     )
 

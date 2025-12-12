@@ -33,12 +33,12 @@ function version_space() {
   };
 }
 
-function Segment(addr, size, stream, frames, version) {
-  return {addr, size, stream, version, frames};
+function Segment(addr, size, stream, frames, version, user_metadata) {
+  return {addr, size, stream, version, frames, user_metadata};
 }
 
-function Block(addr, size, requested_size, frames, free_requested, version) {
-  return {addr, size, requested_size, frames, free_requested, version};
+function Block(addr, size, requested_size, frames, free_requested, version, user_metadata) {
+  return {addr, size, requested_size, frames, free_requested, version, user_metadata};
 }
 
 function EventSelector(outer, events, stack_info, memory_view) {
@@ -113,7 +113,7 @@ function formatSize(num) {
   return `${num.toFixed(1)}YiB`;
 }
 function formatAddr(event) {
-  const prefix = event.action.startsWith('segment') ? 's' : 'b';
+  const prefix = event.action.startsWith('segment') ? 's\'' : 'b\'';
   return `${prefix}${event.addr.toString(16)}_${event.version}`;
 }
 function formatEvent(event) {
@@ -140,7 +140,10 @@ function eventStack(e, allocated, reserved) {
       reserved,
     )} reserved)\n${event}`;
   }
-  return event + '\n' + format_frames(e.frames);
+  const user_metadata_str = format_user_metadata(e.user_metadata);
+  const frames_str = format_frames(e.frames);
+  const forward_frames_str = format_forward_frames(e.forward_frames);
+  return event + '\n' + (user_metadata_str ? user_metadata_str + '\n' : '') + frames_str + forward_frames_str;
 }
 
 function hashCode(num) {
@@ -216,6 +219,7 @@ function MemoryView(outer, stack_info, snapshot, device) {
         seg.stream,
         seg.frames || [],
         seg.version,
+        seg.user_metadata,
       ),
     );
     for (const b of seg.blocks) {
@@ -229,6 +233,7 @@ function MemoryView(outer, stack_info, snapshot, device) {
         b.frames,
         b.state === 'active_pending_free',
         b.version,
+        b.user_metadata,
       );
     }
   }
@@ -307,6 +312,7 @@ function MemoryView(outer, stack_info, snapshot, device) {
             event.frames,
             false,
             event.version,
+            event.user_metadata,
           );
           break;
         case 'free_requested':
@@ -320,6 +326,7 @@ function MemoryView(outer, stack_info, snapshot, device) {
             event.frames,
             true,
             event.version,
+            event.user_metadata,
           );
           break;
         case 'alloc':
@@ -335,6 +342,7 @@ function MemoryView(outer, stack_info, snapshot, device) {
               event.stream,
               event.frames,
               event.version,
+              event.user_metadata,
             ),
           );
           break;
@@ -348,6 +356,7 @@ function MemoryView(outer, stack_info, snapshot, device) {
               event.stream,
               event.frames,
               event.version,
+              event.user_metadata,
             ),
           );
           break;
@@ -426,13 +435,19 @@ function MemoryView(outer, stack_info, snapshot, device) {
           if (t.internal_free > 0) {
             internal = ` (${(t.internal_free / free) * 100}% internal)`;
           }
+          const user_metadata_str = format_user_metadata(t.user_metadata);
+          const frames_str = format_frames(t.frames);
+          const forward_frames_str = format_forward_frames(t.forward_frames);
           return (
             `s${t.addr.toString(16)}_${t.version}: segment ${formatSize(
               t.size,
             )} allocated, ` +
             `${formatSize(free)} free${internal} (stream ${
               t.stream
-            })\n${format_frames(t.frames)}`
+            })\n` +
+            (user_metadata_str ? user_metadata_str + '\n' : '') +
+            frames_str +
+            forward_frames_str
           );
         },
         d => {
@@ -493,12 +508,17 @@ function MemoryView(outer, stack_info, snapshot, device) {
           if (t.free_requested) {
             requested = ' (block freed but waiting due to record_stream)';
           }
+          const user_metadata_str = format_user_metadata(t.user_metadata);
+          const frames_str = format_frames(t.frames);
+          const forward_frames_str = format_forward_frames(t.forward_frames);
           return (
             `b${t.addr.toString(16)}_${t.version} ` +
             `${formatSize(t.requested_size)} allocation${requested} (stream ${
               t.segment.stream
             })\n` +
-            format_frames(t.frames)
+            (user_metadata_str ? user_metadata_str + '\n' : '') +
+            frames_str +
+            forward_frames_str
           );
         },
         removeStroke,
@@ -524,12 +544,17 @@ function MemoryView(outer, stack_info, snapshot, device) {
         d => {
           addStroke(d);
           const t = d.datum();
+          const user_metadata_str = format_user_metadata(t.user_metadata);
+          const frames_str = format_frames(t.frames);
+          const forward_frames_str = format_forward_frames(t.forward_frames);
           return (
             `Free space lost due to rounding ${formatSize(
               t.size - t.requested_size,
             )}` +
             ` (stream ${t.segment.stream})\n` +
-            format_frames(t.frames)
+            (user_metadata_str ? user_metadata_str + '\n' : '') +
+            frames_str +
+            forward_frames_str
           );
         },
         removeStroke,
@@ -760,6 +785,35 @@ function frameFilter({name, filename}) {
   return true;
 }
 
+function format_user_metadata(user_metadata) {
+  if (!user_metadata) {
+    return '';
+  }
+  // Handle string metadata
+  if (typeof user_metadata === 'string') {
+    return `User Metadata:\n  ${user_metadata}`;
+  }
+  // Handle object metadata
+  if (typeof user_metadata === 'object' && Object.keys(user_metadata).length === 0) {
+    return '';
+  }
+  const metadata_lines = Object.entries(user_metadata)
+    .map(([key, value]) => `  ${key}: ${value}`);
+  return 'User Metadata:\n' + metadata_lines.join('\n');
+}
+
+function format_forward_frames(forward_frames) {
+  if (!forward_frames || forward_frames.length === 0) {
+    return '';
+  }
+  // forward_frames is a list of strings (each string is a frame line from the forward pass)
+  // Each frame string already includes newlines, so we just join them directly
+  let frames_str = forward_frames.join('');
+  // Ensure we don't have a trailing newline that could cause display issues
+  frames_str = frames_str.trimEnd();
+  return `\n\n=== Forward Pass Stack Trace (where this tensor was created) ===\n${frames_str}`;
+}
+
 function format_frames(frames) {
   if (frames.length === 0) {
     return (
@@ -771,7 +825,29 @@ function format_frames(frames) {
   }
   const frame_strings = frames
     .filter(frameFilter)
-    .map(f => `${f.filename}:${f.line}:${f.name}`);
+    .map(f => {
+      let frame_str = `${f.filename}:${f.line}:${f.name}`;
+
+      // Add FX debug information if available
+      if (f.fx_node_op || f.fx_node_name || f.fx_node_target) {
+        const fx_parts = [];
+        if (f.fx_node_name) fx_parts.push(`node=${f.fx_node_name}`);
+        if (f.fx_node_op) fx_parts.push(`op=${f.fx_node_op}`);
+        if (f.fx_node_target) fx_parts.push(`target=${f.fx_node_target}`);
+        frame_str += `\n    >> FX: ${fx_parts.join(', ')}`;
+      }
+
+      if (f.fx_original_trace) {
+        frame_str += `\n    >> Original Model Code:`;
+        const original_lines = f.fx_original_trace.trim().split('\n');
+        // Show all lines of the original trace
+        for (const line of original_lines) {
+          frame_str += `\n       ${line}`;
+        }
+      }
+
+      return frame_str;
+    });
   return elideRepeats(frame_strings).join('\n');
 }
 
@@ -980,6 +1056,8 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
       text = `${text}, Total memory used after allocation: ${formatSize(
         elem.max_allocated_mem,
       )}`;
+      const context = elem?.compile_context ?? 'None';
+      text = `${text}, Compile context: ${context}`;
       if (elem.stream !== null) {
         text = `${text}, stream ${elem.stream}`;
       }
@@ -990,7 +1068,12 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
       if (!elem.action.includes('alloc')) {
         text = `${text}\nalloc not recorded, stack trace for free:`;
       }
+      const user_metadata_str = format_user_metadata(elem.user_metadata);
+      if (user_metadata_str) {
+        text = `${text}\n${user_metadata_str}`;
+      }
       text = `${text}\n${format_frames(elem.frames)}`;
+      text = `${text}${format_forward_frames(elem.forward_frames)}`;
       return text;
     },
   };
@@ -1226,6 +1309,7 @@ function create_trace_view(
   dst.selectAll('svg').remove();
   dst.selectAll('div').remove();
 
+  max_entries = Math.min(max_entries, data.elements_length);
   const d = dst.append('div');
   d.append('input')
     .attr('type', 'range')
@@ -1235,13 +1319,15 @@ function create_trace_view(
     .on('change', function () {
       create_trace_view(dst, snapshot, device, plot_segments, this.value);
     });
-  d.append('label').text('Detail');
+  d.append('label').text(
+    `Detail: ${max_entries} of ${data.elements_length} entries`,
+  );
 
   const grid_container = dst
     .append('div')
     .attr(
       'style',
-      'display: grid; grid-template-columns: 1fr; grid-template-rows: 10fr 1fr 8fr; height: 100%; gap: 10px',
+      'display: grid; grid-template-columns: 1fr; grid-template-rows: 10fr 1fr 8fr; flex: 1; min-height: 0; gap: 10px',
     );
 
   const plot_svg = grid_container
@@ -1269,7 +1355,7 @@ function create_trace_view(
     .append('div')
     .attr(
       'style',
-      'grid-column: 1; grid-row: 3; width: 100%; height: 100%; overflow: auto;',
+      'grid-column: 1; grid-row: 3; width: 100%; height: 100%; min-height: 0; overflow: auto;',
     );
   const delegate = ContextViewer(context_div.append('pre').text('none'), data);
   plot.set_delegate(delegate);
@@ -1292,6 +1378,19 @@ function create_settings_view(dst, snapshot, device) {
 }
 
 function unpickle(buffer) {
+  try {
+    const decoder = new TextDecoder();
+    const jsonString = decoder.decode(new Uint8Array(buffer));
+    const data = JSON.parse(jsonString);
+
+    return data;
+  } catch (e) {
+    console.log('Failed to decode the data as JSON, fall back to pickle', e);
+  }
+  return unpickleData(buffer);
+}
+
+function unpickleData(buffer) {
   const bytebuffer = new Uint8Array(buffer);
   const decoder = new TextDecoder();
 
@@ -1598,18 +1697,24 @@ pre {
 }
 html, body {
   height: 100%;
+  margin: 0;
   overflow: clip;
+}
+body {
+  display: flex;
+  flex-direction: column;
 }`;
 
 const head = d3.select('head');
 head.append('style').text(style);
 const body = d3.select('body');
-const snapshot_select = body.append('select');
-const view = body.append('select');
+const controls = body.append('div');
+const snapshot_select = controls.append('select');
+const view = controls.append('select');
 for (const x in kinds) {
   view.append('option').text(x);
 }
-const gpu = body.append('select');
+const gpu = controls.append('select');
 
 function unpickle_and_annotate(data) {
   data = unpickle(data);
@@ -1620,6 +1725,7 @@ function unpickle_and_annotate(data) {
 
 function snapshot_change(f) {
   const view_value = view.node().value;
+  let no_starting_gpu = gpu.node().value == '';
   let device = Number(gpu.node().value);
   const snapshot = snapshot_cache[f];
   gpu.selectAll('option').remove();
@@ -1628,9 +1734,15 @@ function snapshot_change(f) {
     has_segments[s.device] = true;
   }
   let device_valid = false;
+  let maxTraceLength = -1;
+  let defaultDevice = null;
   for (const [i, trace] of snapshot.device_traces.entries()) {
     if (trace.length > 0 || i in has_segments) {
       gpu.append('option').text(i);
+      if (trace.length > maxTraceLength) {
+        maxTraceLength = trace.length;
+        defaultDevice = i;
+      }
       if (i === device) {
         device_valid = true;
         gpu.node().selectedIndex = gpu.node().children.length - 1;
@@ -1640,6 +1752,12 @@ function snapshot_change(f) {
   if (!device_valid) {
     device = Number(gpu.node().value);
   }
+
+  if (no_starting_gpu) {
+    device = defaultDevice;
+    gpu.node().value = device;
+  }
+
   const key = [f, view_value, device];
   if (!(key in selection_to_div)) {
     selection_to_div[key] = d3.select('body').append('div');
@@ -1647,12 +1765,12 @@ function snapshot_change(f) {
   }
   const selected_div = selection_to_div[key];
 
-  selected_div.attr('style', 'display: float; height: 100%');
+  selected_div.attr('style', 'display: flex; flex-direction: column; flex: 1; min-height: 0');
 }
 
 function selected_change() {
   for (const d of Object.values(selection_to_div)) {
-    d.attr('style', 'display: none; height: 100%');
+    d.attr('style', 'display: none; flex-direction: column; flex: 1; min-height: 0');
   }
   const f = snapshot_select.node().value;
   if (f === '') {
@@ -1693,8 +1811,27 @@ body.on('drop', () => {
 selection_to_div[''] = body
   .append('div')
   .text(
-    'Drag and drop a file to load a local snapshot. No data from the snapshot is uploaded.',
+    'Drag and drop or select a file to load a local snapshot. No data from the snapshot is uploaded.',
   );
+
+const fileInput = body.append('input')
+  .attr('type', 'file')
+  .attr('multiple', true)    // allow several snapshots at once
+  .style('margin-left', '8px')
+  .on('change', function () {
+    Array.from(this.files).forEach(file => {
+      add_snapshot(file.name, unique_name => {
+        const reader = new FileReader();
+        reader.onload = e =>
+          finished_loading(unique_name, e.target.result);
+        reader.readAsArrayBuffer(file);
+      });
+    });
+    this.value = null;                       // reset so the same file can be picked again
+    snapshot_select.node().selectedIndex =
+      snapshot_select.node().options.length - 1;
+    selected_change();                       // refresh the UI
+  });
 
 let next_unique_n = 1;
 function add_snapshot(name, loader) {

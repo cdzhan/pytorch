@@ -4,7 +4,8 @@ import functools
 import itertools
 import sys
 import unittest
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 from unittest import mock
 
 import torch
@@ -379,12 +380,15 @@ class TestHooks(FSDPTest):
             register_pre_backward_hooks_call_count += 1
             return orig_register_pre_backward_hooks(*args, **kwargs)
 
-        with mock.patch(
-            "torch.distributed.fsdp._runtime_utils._register_pre_backward_hooks",
-            _register_pre_backward_hooks_with_count,
-        ), mock.patch(
-            "torch.distributed.fsdp._runtime_utils._register_post_backward_hook"
-        ) as register_post_bwd_mock:
+        with (
+            mock.patch(
+                "torch.distributed.fsdp._runtime_utils._register_pre_backward_hooks",
+                _register_pre_backward_hooks_with_count,
+            ),
+            mock.patch(
+                "torch.distributed.fsdp._runtime_utils._register_post_backward_hook"
+            ) as register_post_bwd_mock,
+        ):
             self.assertEqual(register_pre_backward_hooks_call_count, 0)
             self.assertFalse(register_post_bwd_mock.called)
             fsdp_model(*input)
@@ -512,11 +516,15 @@ class TestAutograd(FSDPTest):
             FlatParamHandle._use_unsharded_views = orig_use_unsharded_views
 
 
-devices = ("cuda", "hpu")
-instantiate_device_type_tests(TestHooks, globals(), only_for=devices)
-instantiate_device_type_tests(TestParityWithDDP, globals(), only_for=devices)
-instantiate_device_type_tests(TestNoGrad, globals(), only_for=devices)
-instantiate_device_type_tests(TestParamInit, globals(), only_for=devices)
-instantiate_device_type_tests(TestAutograd, globals(), only_for=devices)
+devices = ("cuda", "hpu", "xpu")
+instantiate_device_type_tests(TestHooks, globals(), only_for=devices, allow_xpu=True)
+instantiate_device_type_tests(
+    TestParityWithDDP, globals(), only_for=devices, allow_xpu=True
+)
+instantiate_device_type_tests(TestNoGrad, globals(), only_for=devices, allow_xpu=True)
+instantiate_device_type_tests(
+    TestParamInit, globals(), only_for=devices, allow_xpu=True
+)
+instantiate_device_type_tests(TestAutograd, globals(), only_for=devices, allow_xpu=True)
 if __name__ == "__main__":
     run_tests()

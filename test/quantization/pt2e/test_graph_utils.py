@@ -1,6 +1,5 @@
 # Owner(s): ["oncall: quantization"]
 import copy
-import unittest
 
 import torch
 import torch._dynamo as torchdynamo
@@ -9,11 +8,10 @@ from torch.ao.quantization.pt2e.graph_utils import (
     get_equivalent_types,
     update_equivalent_types_dict,
 )
-from torch.testing._internal.common_utils import IS_WINDOWS, TestCase
+from torch.testing._internal.common_utils import raise_on_run_directly, TestCase
 
 
 class TestGraphUtils(TestCase):
-    @unittest.skipIf(IS_WINDOWS, "torch.compile is not supported on Windows")
     def test_conv_bn_conv_relu(self):
         class M(torch.nn.Module):
             def __init__(self) -> None:
@@ -32,7 +30,7 @@ class TestGraphUtils(TestCase):
         example_inputs = (torch.randn(1, 3, 5, 5),)
 
         # program capture
-        m, guards = torchdynamo.export(  # noqa: F841©
+        m, guards = torchdynamo.export(  # noqa: F841
             m,
             *copy.deepcopy(example_inputs),
             aten_graph=True,
@@ -59,7 +57,6 @@ class TestGraphUtils(TestCase):
 
         self.assertRaises(ValueError, x)
 
-    @unittest.skipIf(IS_WINDOWS, "torch.compile is not supported on Windows")
     def test_conv_bn_relu(self):
         class M(torch.nn.Module):
             def __init__(self) -> None:
@@ -94,7 +91,6 @@ class TestGraphUtils(TestCase):
         )
         self.assertEqual(len(fused_partitions), 0)
 
-    @unittest.skipIf(IS_WINDOWS, "torch.compile is not supported on Windows")
     def test_customized_equivalet_types_dict(self):
         class M(torch.nn.Module):
             def __init__(self) -> None:
@@ -121,3 +117,7 @@ class TestGraphUtils(TestCase):
             [torch.nn.Conv2d, torch.nn.ReLU6],
         )
         self.assertEqual(len(fused_partitions), 1)
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_quantization.py")

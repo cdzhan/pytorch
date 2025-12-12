@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Optional, TYPE_CHECKING, Union
 
 from torch._inductor import config
 from torch._inductor.utils import get_benchmark_name
@@ -16,6 +16,9 @@ from torch.utils._ordered_set import OrderedSet
 
 # Prevent circular import
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torch._inductor.runtime.triton_compat import Config
     from torch._inductor.scheduler import BaseSchedulerNode
 
 # counter for tracking how many kernels have been generated
@@ -51,6 +54,11 @@ num_matches_for_scatter_upon_const_tensor = 0
 
 num_loop_reordering = 0
 
+# counter for parallel reduction.
+parallel_reduction_count = 0
+
+codegen_mix_order_reduction = 0
+
 
 # reset all counters
 def reset() -> None:
@@ -63,6 +71,8 @@ def reset() -> None:
     global num_comprehensive_padding
     global num_matches_for_scatter_upon_const_tensor
     global num_loop_reordering
+    global parallel_reduction_count
+    global codegen_mix_order_reduction
 
     generated_kernel_count = 0
     generated_cpp_vec_kernel_count = 0
@@ -75,6 +85,8 @@ def reset() -> None:
     num_comprehensive_padding = 0
     num_matches_for_scatter_upon_const_tensor = 0
     num_loop_reordering = 0
+    parallel_reduction_count = 0
+    codegen_mix_order_reduction = 0
 
 
 @dataclass
@@ -92,7 +104,7 @@ class CachedMetricsDeltas:
     num_matches_for_scatter_upon_const_tensor: int
 
 
-def get_metric_fields() -> List[str]:
+def get_metric_fields() -> list[str]:
     return [field.name for field in dataclasses.fields(CachedMetricsDeltas)]
 
 
@@ -132,23 +144,23 @@ class MetricTable:
     num_rows_added: int = 0
 
     def add_row(
-        self, row_fn: Callable[[], Dict[str, Optional[Union[str, float]]]]
+        self, row_fn: Callable[[], dict[str, Optional[Union[str, float]]]]
     ) -> None:
         if self.table_name not in enabled_metric_tables():
             return
 
         row_dict = row_fn()
-        assert len(self.column_names) == len(
-            row_dict
-        ), f"{len(self.column_names)} v.s. {len(row_dict)}"
-        assert OrderedSet(self.column_names) == OrderedSet(
-            row_dict.keys()
-        ), f"{OrderedSet(self.column_names)} v.s. {OrderedSet(row_dict.keys())}"
+        assert len(self.column_names) == len(row_dict), (
+            f"{len(self.column_names)} v.s. {len(row_dict)}"
+        )
+        assert OrderedSet(self.column_names) == OrderedSet(row_dict.keys()), (
+            f"{OrderedSet(self.column_names)} v.s. {OrderedSet(row_dict.keys())}"
+        )
 
-        row = [
-            get_benchmark_name(),
-        ]
-        row += [row_dict[column_name] for column_name in self.column_names]
+        bn = get_benchmark_name()
+        # assert bn is not None
+        row = [bn] + [row_dict[column_name] for column_name in self.column_names]
+        assert all(isinstance(i, (str, float, type(None))) for i in row)
         self._write_row(row)
 
     def output_filename(self) -> str:
@@ -160,7 +172,7 @@ class MetricTable:
             writer = csv.writer(fd, lineterminator="\n")
             writer.writerow(["model_name"] + self.column_names)
 
-    def _write_row(self, row: List[str]) -> None:
+    def _write_row(self, row: list[str | float | None]) -> None:
         filename = self.output_filename()
         if self.num_rows_added == 0 and not os.path.exists(filename):
             self.write_header()
@@ -181,7 +193,7 @@ class MetricTable:
             writer.writerow(row)
 
     @staticmethod
-    def register_table(name: str, column_names: List[str]) -> None:
+    def register_table(name: str, column_names: list[str]) -> None:
         table = MetricTable(name, column_names)
         REGISTERED_METRIC_TABLES[name] = table
 
@@ -428,14 +440,14 @@ def enabled_metric_tables() -> OrderedSet[str]:
 
 @lru_cache
 def enabled_metric_tables_impl(config_str: str) -> OrderedSet[str]:
-    enabled = OrderedSet[str]()
+    enabled: OrderedSet[str] = OrderedSet()
     for name in config_str.split(","):
         name = name.strip()
         if not name:
             continue
-        assert (
-            name in REGISTERED_METRIC_TABLES
-        ), f"Metric table name {name} is not registered"
+        assert name in REGISTERED_METRIC_TABLES, (
+            f"Metric table name {name} is not registered"
+        )
         enabled.add(name)
     return enabled
 
@@ -447,3 +459,27 @@ def is_metric_table_enabled(name: str) -> bool:
 def get_metric_table(name: str) -> MetricTable:
     assert name in REGISTERED_METRIC_TABLES, f"Metric table {name} is not defined"
     return REGISTERED_METRIC_TABLES[name]
+
+
+MetricTable.register_table(
+    "kernel_autotune",
+    [
+        "kernel_path",
+        "kernel_name",
+        "triton_config",
+        "latency_ms",
+    ],
+)
+
+
+def log_kernel_autotune_result(
+    kernel_path: str, kernel_name: str, config: Config, latency: float
+) -> None:
+    get_metric_table("kernel_autotune").add_row(
+        lambda: {
+            "kernel_path": kernel_path,
+            "kernel_name": kernel_name,
+            "triton_config": str(config),
+            "latency_ms": latency,
+        }
+    )

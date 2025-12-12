@@ -44,7 +44,7 @@ class C10_XPU_API XPUStream {
   }
 
   /// Construct a XPUStream from a Stream with no error checking.
-  explicit XPUStream(Unchecked, Stream stream) : stream_(stream) {}
+  explicit XPUStream(Unchecked /*unused*/, Stream stream) : stream_(stream) {}
 
   bool operator==(const XPUStream& other) const noexcept {
     return unwrap() == other.unwrap();
@@ -57,6 +57,11 @@ class C10_XPU_API XPUStream {
   /// Implicit conversion to sycl::queue&.
   operator sycl::queue&() const {
     return queue();
+  }
+
+  /// Implicit conversion to sycl::queue*.
+  operator sycl::queue*() const {
+    return &queue();
   }
 
   /// Implicit conversion to Stream (a.k.a., forget that the stream is a

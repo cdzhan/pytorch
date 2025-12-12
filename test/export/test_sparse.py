@@ -3,11 +3,10 @@
 # Test to ensure sparsity information propagates properly into traced graph.
 #
 
-import sys
 import unittest
 
 import torch
-from torch._dynamo.config import is_fbcode
+from torch._environment import is_fbcode
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -91,12 +90,9 @@ class SparseActivationCSR(torch.nn.Module):
 
 
 @unittest.skipIf(is_fbcode(), "See torch._dynamo.config")
-@unittest.skipIf(
-    sys.version_info >= (3, 12), "torch.compile is not supported on python 3.12+"
-)
 class TestSparseProp(TestCase):
     def setUp(self):
-        TestCase.setUp(self)
+        super().setUp()
 
     def assertEqualMeta(self, x, y):
         self.assertIsInstance(x, FakeTensor)

@@ -26,15 +26,19 @@ Error Formatting:
     - Debugging utilities for error reporting
 """
 
+import json
 import logging
-import os
+import re
 import textwrap
 import typing
 from enum import auto, Enum
+from functools import lru_cache
+from pathlib import Path
 from traceback import extract_stack, format_exc, format_list, StackSummary
 from typing import Any, NoReturn, Optional, TYPE_CHECKING
 
 import torch._guards
+from torch._utils_internal import get_file_path_2
 
 from . import config
 from .utils import counters
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
 
     from torch._guards import CompileId
 
+    from .output_graph import DynamoTracerOutput
     from .symbolic_convert import InstructionTranslatorBase
     from .types import DynamoFrameType
 
@@ -62,10 +67,16 @@ graph_breaks_log = torch._logging.getArtifactLogger(__name__, "graph_breaks")
 
 
 class TorchDynamoException(RuntimeError):
-    pass
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._torch_dynamo_tracer_output: Optional[DynamoTracerOutput] = None
 
 
 class InternalTorchDynamoError(TorchDynamoException):
+    pass
+
+
+class ResumePrologueTracingError(TorchDynamoException):
     pass
 
 
@@ -129,11 +140,7 @@ class ShortenTraceback(TorchDynamoException):
 
     def remove_dynamo_frames(self) -> typing.Self:
         tb = self.__traceback__
-        if (
-            self.first_useful_frame is None
-            or tb is None
-            or os.environ.get("TORCHDYNAMO_VERBOSE") == "1"
-        ):
+        if self.first_useful_frame is None or tb is None or config.verbose:
             return self
         while tb.tb_frame is not self.first_useful_frame:
             tb = tb.tb_next
@@ -155,9 +162,17 @@ class BackendCompilerFailed(ShortenTraceback):
 
 
 class Unsupported(TorchDynamoException):
-    def __init__(self, msg: str, *, case_name: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        msg: str,
+        *,
+        case_name: Optional[str] = None,
+        real_stack: None | StackSummary = None,
+    ) -> None:
         super().__init__(msg)
-        self.real_stack = torch._guards.TracingContext.extract_stack()
+        if not real_stack:
+            real_stack = torch._guards.TracingContext.extract_stack()
+        self.real_stack = real_stack
         self.msg = msg
         self.category: Optional[str] = None
         self.add_to_stats()
@@ -183,33 +198,26 @@ class RecompileError(TorchDynamoException):
 
 
 class ArgsMismatchError(Unsupported):
-    def __init__(self, msg: str) -> None:
-        super().__init__(msg)
+    pass
 
 
 class AttributeMutationError(Unsupported):
-    def __init__(self, msg: str) -> None:
-        super().__init__(msg)
+    pass
 
 
 class InfiniteGeneratorError(Unsupported):
     # Raised when the number of yielded values is greater than MAX_ITERATOR_LIMIT
-    def __init__(self, msg: str) -> None:
-        super().__init__(msg)
+    pass
 
 
 class SideEffectsError(Unsupported):
-    def __init__(self, msg: str) -> None:
-        super().__init__(msg)
+    pass
 
 
 class CondOpArgsMismatchError(ArgsMismatchError):
     """
     Internal error from cond() due to arguments mismatch.
     """
-
-    def __init__(self, msg: str) -> None:
-        super().__init__(msg)
 
 
 class UserErrorType(Enum):
@@ -255,12 +263,25 @@ class RecompileLimitExceeded(Unsupported):
     pass
 
 
+# debug exception thrown when tracing torch._dynamo.step_unsupported()
+class StepUnsupported(TorchDynamoException):
+    def __init__(self) -> None:
+        self.real_stack = torch._guards.TracingContext.extract_stack()
+
+
 class UnsafeScriptObjectError(TorchDynamoException):
     pass
 
 
 class UncapturedHigherOrderOpError(TorchDynamoException):
-    pass
+    def __init__(self, msg: str, real_stack: Optional[StackSummary] = None) -> None:
+        super().__init__(msg)
+        self.msg = msg
+        self.real_stack = (
+            real_stack
+            if real_stack is not None
+            else torch._guards.TracingContext.extract_stack()
+        )
 
 
 class IncorrectUsage(Exception):
@@ -274,19 +295,33 @@ class FailOnRecompileLimitHit(Exception):
     pass
 
 
-class ObservedException(TorchDynamoException):
-    # An exception observed during the tracing. This exception is used by Dynamo to handle exceptions.
+class PackageError(TorchDynamoException):
     pass
 
 
+class ObservedException(TorchDynamoException):
+    # An exception observed during the tracing. This exception is used by Dynamo to handle exceptions.
+    def __init__(
+        self, *args: Any, real_stack: Optional[StackSummary] = None, **kwargs: Any
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.real_stack: StackSummary = (
+            real_stack
+            if real_stack is not None
+            else torch._guards.TracingContext.extract_stack()
+        )
+
+
 class ObservedUserStopIteration(ObservedException):
-    # An UserStopIteraion exception observed during the Dynamo tracing (e.g Dynamo tracing __next__)
+    # An UserStopIteration exception observed during the Dynamo tracing (e.g Dynamo tracing __next__)
     value: Optional[Any]
 
     # Reference `StopIteration_init` in CPython
     # https://github.com/python/cpython/blob/3.11/Objects/exceptions.c#L568-L584
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__("unhandled `raise StopIteration`")
+    def __init__(
+        self, *args: Any, real_stack: Optional[StackSummary] = None, **kwargs: Any
+    ) -> None:
+        super().__init__("unhandled `raise StopIteration`", real_stack=real_stack)
         if len(args) > 0:
             self.value = args[0]
         else:
@@ -346,9 +381,11 @@ observed_exception_map = {
 
 def get_dynamo_observed_exception(exc_type: type[Exception]) -> type[ObservedException]:
     if exc_type not in observed_exception_map:
-        observed_exception_map[exc_type] = type(
-            f"Observed{exc_type.__name__}Error", (ObservedException,), {}
+        name = getattr(exc_type, "__name__", str(exc_type))
+        observed_exception_map[exc_type] = type(  # type: ignore[assignment]
+            f"Observed{name}Error", (ObservedException,), {}
         )
+    # pyrefly: ignore [index-error]
     return observed_exception_map[exc_type]
 
 
@@ -364,8 +401,12 @@ def raise_observed_exception(
     # CPython here raises an exception. Since there is no python code, we have to manually setup the exception
     # stack and raise the exception.
     exception_vt = BuiltinVariable(exc_type).call_function(tx, args or [], kwargs or {})  # type: ignore[arg-type]
-    tx.exn_vt_stack.append(exception_vt)
-    raise observed_exception_map[exc_type]
+    tx.exn_vt_stack.set_current_exception(exception_vt)  # type: ignore[arg-type]
+    raised_exc = get_dynamo_observed_exception(exc_type)
+    # Store the original exception arguments for better error messages
+    if args:
+        raise raised_exc(*args)
+    raise raised_exc
 
 
 def handle_observed_exception(tx: Any) -> None:
@@ -393,7 +434,7 @@ def handle_observed_exception(tx: Any) -> None:
     #
 
     # Fortunately this translates to a simple pop from the exn_vt_stack
-    tx.exn_vt_stack.pop()
+    tx.exn_vt_stack.clear_current_exception()
 
 
 # These exceptions are ok to fallback to eager/graph_break.
@@ -402,11 +443,18 @@ exceptions_allowed_to_be_fallback = (
     torch._subclasses.fake_tensor.DynamicOutputShapeException,
     torch._subclasses.fake_tensor.UnsupportedOperatorException,
     torch._subclasses.fake_tensor.UnsupportedFakeTensorException,
+    torch._subclasses.fake_tensor.UnsupportedMutationAliasingException,
 )
 
 
 def unimplemented_with_warning(
-    e: Exception, code: types.CodeType, msg: str
+    e: Exception,
+    code: types.CodeType,
+    *,
+    gb_type: str,
+    context: str,
+    explanation: str,
+    hints: list[str],
 ) -> NoReturn:
     # This function calls unimplemented internally and eventually graph breaks
     # or falls to eager. unimplemented itself does not print any user warnings,
@@ -425,25 +473,127 @@ def unimplemented_with_warning(
         payload_fn=lambda: graph_break_msg,
     )
     graph_breaks_log.debug("%s", graph_break_msg)
-    log.warning(msg)
-    unimplemented(msg, from_exc=e)
+    _unimplemented = unimplemented
+    # to prevent a graph break registry entry
+    _unimplemented(
+        gb_type=gb_type,
+        context=context,
+        explanation=explanation,
+        hints=hints,
+        from_exc=e,
+        log_warning=True,
+    )
+
+
+def format_graph_break_message(
+    gb_type: str,
+    context: str,
+    explanation: str,
+    hints: list[str],
+) -> str:
+    explanation = textwrap.indent(explanation, "    ").lstrip()
+    hints_str = "\n".join(
+        "  Hint: " + textwrap.indent(hint, "    ").lstrip() for hint in hints
+    )
+    context = textwrap.indent(context, "    ").lstrip()
+
+    msg = f"""\
+{gb_type}
+  Explanation: {explanation}
+{hints_str}
+
+  Developer debug context: {context}
+"""
+    documentation_link = get_gbid_documentation_link(gb_type)
+
+    if documentation_link:
+        msg += f"\n For more details about this graph break, please visit: {documentation_link}"
+
+    return msg
+
+
+@lru_cache(maxsize=1)
+def _load_gb_type_to_gb_id_map() -> dict[str, Any]:
+    """
+    Loads the gb_type to gb_id map from the graph break registry from JSON file with caching.
+
+    Includes historical gb_type (mapping behavior of duplicate gb_types with different gb_ids is undefined).
+    """
+    try:
+        script_dir = Path(__file__).resolve().parent
+        registry_path = get_file_path_2(
+            "", str(script_dir), "graph_break_registry.json"
+        )
+        with open(registry_path) as f:
+            registry = json.load(f)
+    except Exception:
+        log.exception("Error accessing the registry file")
+        registry = {}
+
+    mapping = {}
+    for k, v in registry.items():
+        for entry in v:
+            mapping[entry["Gb_type"]] = k
+
+    return mapping
+
+
+def get_gbid_documentation_link(gb_type: str) -> Optional[str]:
+    """
+    Retrieves the GBID documentation link for a given graph break type.
+
+    Args:
+        gb_type: The graph break type to look up.
+
+    Returns:
+        A string containing the documentation URL if found, otherwise None.
+    """
+    GRAPH_BREAK_SITE_URL = (
+        "https://meta-pytorch.github.io/compile-graph-break-site/gb/"  # @lint-ignore
+    )
+
+    gb_type_to_gb_id_map = _load_gb_type_to_gb_id_map()
+
+    if gb_type in gb_type_to_gb_id_map:
+        return (
+            f"{GRAPH_BREAK_SITE_URL}gb{gb_type_to_gb_id_map[gb_type].lstrip('GB')}.html"
+        )
+
+    return None
 
 
 _NOTHING = object()
 
 
 def unimplemented(
-    msg: str, *, from_exc: Any = _NOTHING, case_name: Optional[str] = None
+    *,
+    gb_type: str,
+    context: str,
+    explanation: str,
+    hints: list[str],
+    from_exc: Any = _NOTHING,
+    log_warning: bool = False,
 ) -> NoReturn:
-    assert msg != os.environ.get("BREAK", False)
+    """
+    Called within dynamo to cause a graph break.
+    Args:
+        gb_type: Context-free graph break type. It should be a short string without any
+                 information specific to the tracing context (i.e. no dynamically-generated strings)
+        context: Developer context for the graph break. It can contain tracing context/dynamic strings.
+        explanation: User-facing context-dependent explanation for the graph break. Can be dynamic.
+        hints: List of user-facing hints for the graph break.
+    """
+
+    msg = format_graph_break_message(gb_type, context, explanation, hints)
+
+    if log_warning:
+        log.warning(msg)
     if from_exc is not _NOTHING:
-        raise Unsupported(msg, case_name=case_name) from from_exc
-    raise Unsupported(msg, case_name=case_name)
-
-
-def warning(msg: str) -> None:
-    counters["warnings"][msg] += 1
-    assert msg != os.environ.get("BREAK", False)
+        past_real_stack = None
+        if hasattr(from_exc, "real_stack"):
+            past_real_stack = from_exc.real_stack
+        raise Unsupported(msg, real_stack=past_real_stack) from from_exc
+    raise Unsupported(msg)
 
 
 # KeyError has special handling for its args
@@ -459,6 +609,18 @@ class KeyErrorMsg:
         return self.__str__()
 
 
+def augment_exc_message_with_hop_name(exc: Exception, msg: str) -> str:
+    # Add HOP context right after before the explanation if present;
+    # otherwise after the message
+    if hasattr(exc, "_hop_name"):
+        lines = msg.partition("\n  Explanation:")
+        msg = (
+            f"{lines[0]}\n  Higher Order Operator: {exc._hop_name}{lines[1]}{lines[2]}"  # type: ignore[attr-defined]
+        )
+
+    return msg
+
+
 def augment_exc_message(exc: Exception, msg: str = "\n", export: bool = False) -> None:
     import traceback
 
@@ -470,11 +632,17 @@ def augment_exc_message(exc: Exception, msg: str = "\n", export: bool = False) -
         msg += f"\nfrom user code:\n {''.join(traceback.format_list(real_stack))}"
 
     if config.replay_record_enabled and hasattr(exc, "record_filename"):
-        msg += f"\nLast frame execution written to {exc.record_filename}. To run only this frame while debugging, run\
+        msg += (
+            f"\nLast frame execution written to {exc.record_filename}. To run only this frame while debugging, run\
  torch._dynamo.replay('{exc.record_filename}').\n"
+        )
 
     if not config.verbose and hasattr(exc, "real_stack"):
-        msg += '\nSet TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information\n'
+        msg += (
+            "\nSet TORCHDYNAMO_VERBOSE=1 for the internal stack trace "
+            "(please do this especially if you're reporting a bug to PyTorch). "
+            'For even more developer context, set TORCH_LOGS="+dynamo"\n'
+        )
 
     if hasattr(exc, "inner_exception") and hasattr(
         exc.inner_exception, "minifier_path"
@@ -493,6 +661,8 @@ def augment_exc_message(exc: Exception, msg: str = "\n", export: bool = False) -
 
     old_msg = "" if len(exc.args) == 0 else str(exc.args[0])
 
+    old_msg = augment_exc_message_with_hop_name(exc, old_msg)
+
     if isinstance(exc, KeyError):
         exc.args = (KeyErrorMsg(old_msg + msg),) + exc.args[1:]
     else:
@@ -510,6 +680,10 @@ def get_exc_message(
         lineno = e.innermost_user_frame_summary.lineno  # type: ignore[attr-defined]
     e.compile_id = compile_id  # type: ignore[attr-defined]
     return filename, lineno
+
+
+def get_stack_above_dynamo() -> StackSummary:
+    return filter_stack(extract_stack())
 
 
 def get_real_stack(
@@ -537,7 +711,7 @@ def get_real_stack(
         # from where we are right now and rely on filter_stack to
         # get rid of all the dynamo frames.  For ease of testing
         # we apply this behavior to ALL Python versions
-        stack_above_dynamo = filter_stack(extract_stack())
+        stack_above_dynamo = get_stack_above_dynamo()
     else:
         stack_above_dynamo = StackSummary()
 
@@ -559,6 +733,49 @@ def filter_stack(stack: StackSummary) -> StackSummary:
         user_stack.append(frame)
 
     return user_stack
+
+
+def remove_resume_prefix(name: str) -> Optional[str]:
+    from .resume_execution import TORCH_DYNAMO_RESUME_IN_PREFIX
+
+    match = re.match(f"{TORCH_DYNAMO_RESUME_IN_PREFIX}_(\\w+)_at_\\d+", name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def collapse_resume_frames(stack: StackSummary) -> StackSummary:
+    """
+    When we graph break, we create a resume function and make a regular Python call
+    to it, which gets intercepted by Dynamo. This behavior is normally shown in the
+    traceback, which can be confusing to a user. So we can filter out resume frames
+    for better traceback clarity.
+
+    Example:
+    File "..." line 3, in f
+        <line 3>
+    File "..." line 5, in torch_dynamo_resume_in_f_at_80
+        <line 5>
+    File "..." line 10, in torch_dynamo_resume_in_f_at_120
+        <line 10>
+
+    becomes
+    File "..." line 10, in f
+        <line 10>
+    """
+
+    new_stack = StackSummary()
+    for frame in stack:
+        if frame.filename is None:
+            continue
+        name = remove_resume_prefix(frame.name)
+        if new_stack and name and new_stack[-1].name == name:
+            new_stack[-1] = frame
+            frame.name = name
+        else:
+            new_stack.append(frame)
+
+    return new_stack
 
 
 def format_error_msg_verbose(
@@ -586,6 +803,38 @@ def format_error_msg_verbose(
         msg += "=" * 10
 
     return msg
+
+
+def format_frame_info(code: types.CodeType) -> str:
+    return (
+        f"{getattr(code, 'co_name', '<unknown>')} "
+        f"({getattr(code, 'co_filename', '<unknown>')} "
+        f"line {getattr(code, 'co_firstlineno', 0)})"
+    )
+
+
+def format_skip_frame_message(code: Optional[types.CodeType], reason: str) -> str:
+    if code is not None:
+        frame_info = format_frame_info(code)
+        return (
+            f"torch.compile intentionally decided to skip the frame {frame_info} and fall back to eager.\n"
+            f"Reason: {reason}"
+        )
+    else:
+        return (
+            f"torch.compile intentionally decided to skip the frame and fall back to eager.\n"
+            f"Reason: {reason}"
+        )
+
+
+def format_loop_skip_frame_message(code: types.CodeType, frame_summary: str) -> str:
+    frame_info = format_frame_info(code)
+    return (
+        "Skipping frame because there is a graph break in a for/while loop\n"
+        f"torch.compile intentionally decided to skip the frame {frame_info} and fall back to eager.\n"
+        f"Reason: Skipping frame because there is a graph break in a for/while loop.\n"
+        f"{frame_summary}"
+    )
 
 
 def format_error_msg(

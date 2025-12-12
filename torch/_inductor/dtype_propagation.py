@@ -1,7 +1,7 @@
 # mypy: allow-untyped-defs
 import functools
-from collections.abc import Sequence
-from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING, TypeVar, Union
+from collections.abc import Callable, Sequence
+from typing import Any, Optional, Protocol, TYPE_CHECKING, TypeVar, Union
 
 import sympy
 
@@ -19,8 +19,7 @@ T = TypeVar("T")
 
 class DTypeVar(Protocol):
     @property
-    def dtype(self) -> torch.dtype:
-        ...
+    def dtype(self) -> torch.dtype: ...
 
 
 DTypeArg = Union[DTypeVar, torch.types.Number, str, OpsValue]
@@ -30,7 +29,7 @@ DTypeArg = Union[DTypeVar, torch.types.Number, str, OpsValue]
 # So first decompose CSEVars -> tuple before calling this
 
 
-@functools.lru_cache(None)
+@functools.cache
 def get_promoted_dtype(
     *args: Sequence[tuple[torch.dtype, bool]],
     type_promotion_kind: Optional[ELEMENTWISE_TYPE_PROMOTION_KIND] = None,
@@ -59,6 +58,7 @@ def promote_types(
 ):
     dtype_prop_candidates = []
 
+    # pyrefly: ignore [bad-assignment]
     for arg in args:
         assert not isinstance(arg, str)
         if isinstance(arg, OpsValue):
@@ -69,6 +69,7 @@ def promote_types(
             dtype_prop_candidates.append((type_to_dtype(type(arg)), True))
             continue
 
+        # pyrefly: ignore [missing-attribute]
         dtype_prop_candidates.append((arg.dtype, getattr(arg, "is_scalar", False)))
 
     dtype = get_promoted_dtype(
@@ -182,7 +183,7 @@ class DtypePropagationOpsHandler:
         ):
             return upcast_compute_type(dtype)
 
-        return torch.int32 if V.kernel.index_dtype == "tl.int32" else torch.int64
+        return V.kernel.get_index_dtype_as_torch_dtype()
 
     @staticmethod
     def to_dtype(
@@ -245,6 +246,15 @@ class DtypePropagationOpsHandler:
 
     @staticmethod
     def store(name: str, index, value: DTypeArg, mode: Optional[str] = None) -> None:
+        return None
+
+    @staticmethod
+    def partial_accumulate(
+        name: str,
+        reduction_type: str,
+        value: DTypeArg,
+        extra_meta: dict[str, Any],
+    ) -> None:
         return None
 
     @staticmethod
@@ -349,6 +359,11 @@ class DtypePropagationOpsHandler:
         return torch.int32
 
     @staticmethod
+    def dot(x: DTypeArg, y: DTypeArg) -> torch.dtype:
+        # triton tl.dot out_dtype is tl.float32 by default.
+        return torch.float32
+
+    @staticmethod
     def inline_asm_elementwise(
         *inputs, asm, constraints=None, dtype=torch.float32, is_pure=True, pack=1
     ):
@@ -356,10 +371,6 @@ class DtypePropagationOpsHandler:
 
     @staticmethod
     def lshift(x: DTypeArg, y: DTypeArg) -> torch.dtype:
-        return promote_types([x])
-
-    @staticmethod
-    def libdevice_abs(x: DTypeArg) -> torch.dtype:
         return promote_types([x])
 
     @staticmethod
@@ -377,6 +388,10 @@ class DtypePropagationOpsHandler:
         raise AssertionError(
             f"{type(self).__name__}: ops.placeholder should not appear here"
         )
+
+    @staticmethod
+    def device_assert_async(cond, msg: str) -> None:
+        return None
 
 
 if TYPE_CHECKING:

@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+from typing import Optional
+
 import torch
 from torch import nan, Tensor
 from torch.distributions import constraints
@@ -47,10 +49,17 @@ class Categorical(Distribution):
         probs (Tensor): event probabilities
         logits (Tensor): event log probabilities (unnormalized)
     """
+
+    # pyrefly: ignore [bad-override]
     arg_constraints = {"probs": constraints.simplex, "logits": constraints.real_vector}
     has_enumerate_support = True
 
-    def __init__(self, probs=None, logits=None, validate_args=None):
+    def __init__(
+        self,
+        probs: Optional[Tensor] = None,
+        logits: Optional[Tensor] = None,
+        validate_args: Optional[bool] = None,
+    ) -> None:
         if (probs is None) == (logits is None):
             raise ValueError(
                 "Either `probs` or `logits` must be specified, but not both."
@@ -58,11 +67,14 @@ class Categorical(Distribution):
         if probs is not None:
             if probs.dim() < 1:
                 raise ValueError("`probs` parameter must be at least one-dimensional.")
+            # pyrefly: ignore [read-only]
             self.probs = probs / probs.sum(-1, keepdim=True)
         else:
+            assert logits is not None  # helps mypy
             if logits.dim() < 1:
                 raise ValueError("`logits` parameter must be at least one-dimensional.")
             # Normalize
+            # pyrefly: ignore [read-only]
             self.logits = logits - logits.logsumexp(dim=-1, keepdim=True)
         self._param = self.probs if probs is not None else self.logits
         self._num_events = self._param.size()[-1]
@@ -90,6 +102,7 @@ class Categorical(Distribution):
         return self._param.new(*args, **kwargs)
 
     @constraints.dependent_property(is_discrete=True, event_dim=0)
+    # pyrefly: ignore [bad-override]
     def support(self):
         return constraints.integer_interval(0, self._num_events - 1)
 

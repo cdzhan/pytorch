@@ -1,5 +1,5 @@
 #include <ATen/core/Vitals.h>
-#include <cstdlib>
+#include <c10/util/env.h>
 #include <iostream>
 
 namespace at::vitals {
@@ -8,8 +8,8 @@ APIVitals VitalsAPI;
 
 std::ostream& operator<<(std::ostream& os, TorchVital const& tv) {
   for (const auto& m : tv.attrs) {
-    os << "[TORCH_VITAL] " << tv.name << "." << m.first << "\t\t "
-       << m.second.value << "\n";
+    os << "[TORCH_VITAL] " << tv.name << '.' << m.first << "\t\t "
+       << m.second.value << '\n';
   }
   return os;
 }
@@ -41,9 +41,9 @@ bool torchVitalEnabled() {
   // If this is a performance hit, make `enabled` variable static
   // and return `const bool&` instead
   bool enabled = []() {
-    auto e = getenv("TORCH_VITAL");
-    if (e != nullptr) {
-      return e[0] != '\0';
+    auto const e = c10::utils::get_env("TORCH_VITAL");
+    if (e.has_value()) {
+      return !e.value().empty();
     }
     return false;
   }();

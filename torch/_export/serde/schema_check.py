@@ -64,14 +64,14 @@ def _staged_schema():
                 )
             elif o := typing.get_origin(t):
                 # Lemme know if there's a better way to do this.
-                if o == list:
+                if o is list:
                     yaml_head, cpp_head, thrift_head, thrift_tail = (
                         "List",
                         "std::vector",
                         "list<",
                         ">",
                     )
-                elif o == dict:
+                elif o is dict:
                     yaml_head, cpp_head, thrift_head, thrift_tail = (
                         "Dict",
                         "std::unordered_map",
@@ -81,14 +81,14 @@ def _staged_schema():
                 elif o == Union:
                     assert level == 0, "Optional is only supported at the top level."
                     args = typing.get_args(t)
-                    assert len(args) == 2 and args[1] == type(None)
+                    assert len(args) == 2 and args[1] is type(None)
                     yaml_type, cpp_type, thrift_type = dump_type(args[0], level + 1)
                     return (
                         f"Optional[{yaml_type}]",
                         f"std::optional<{cpp_type}>",
                         f"optional {thrift_type}",
                     )
-                elif o == Annotated:
+                elif o is Annotated:
                     return dump_type(t.__origin__, level)
                 else:
                     raise AssertionError(f"Type {t} is not supported in export schema.")
@@ -129,13 +129,13 @@ def _staged_schema():
             t, cpp_type, thrift_type = dump_type(f.type, 0)
             ret = {"type": t}
             cpp_default: Optional[str] = None
-            assert (
-                typing.get_origin(f.type) == Annotated
-            ), f"Field {f.name} must be annotated with an integer id."
+            assert typing.get_origin(f.type) is Annotated, (
+                f"Field {f.name} must be annotated with an integer id."
+            )
             thrift_id = f.type.__metadata__[0]
-            assert (
-                type(thrift_id) is int
-            ), f"Field {f.name} must be annotated with an integer id."
+            assert type(thrift_id) is int, (
+                f"Field {f.name} must be annotated with an integer id."
+            )
 
             value = dataclasses.MISSING
             if f.default is not dataclasses.MISSING:
@@ -173,12 +173,23 @@ def _staged_schema():
 
     def _handle_int_enum(name, ty):
         yaml_ret[name] = {"kind": "enum", "fields": {x.name: x.value for x in ty}}
-        cpp_enum_defs[
-            name
-        ] = f"""
+        cpp_enum_defs[name] = f"""
 enum class {name} {{
 {chr(10).join([f"  {x.name} = {x.value}," for x in ty])}
 }};
+
+inline std::string_view printEnum(const {name}& e) {{
+  switch (e) {{
+{chr(10).join([f"    case {name}::{x.name}: return {chr(34)}{x.name}{chr(34)};" for x in ty])}
+    default:
+      throw std::runtime_error("Unknown enum value");
+  }}
+}}
+
+inline void parseEnum(std::string_view s, {name}& t) {{
+{chr(10).join([f"  if (s == {chr(34)}{x.name}{chr(34)}) {{ t = {name}::{x.name}; return; }}" for x in ty])}
+  throw std::runtime_error("Unknown enum value: " + std::string{{s}});
+}}
 """
         thrift_enum_defs.append(
             f"""
@@ -227,14 +238,17 @@ enum {name} {{
 
         from_json_def = f"""{{
   {name} nlohmann_json_default_obj;
-{chr(10).join(
-    [f'  nlohmann_json_t.{name} = nlohmann_json_j.value("{name}", nlohmann_json_default_obj.{name});'
-    for name, f in cpp_fields.items()])}
+{
+            chr(10).join(
+                [
+                    f'  nlohmann_json_t.{name} = nlohmann_json_j.value("{name}", nlohmann_json_default_obj.{name});'
+                    for name, f in cpp_fields.items()
+                ]
+            )
+        }
 }}
 """
-        cpp_class_defs[
-            name
-        ] = f"""
+        cpp_class_defs[name] = f"""
 class {name} {{
  private:
 {field_decls}
@@ -249,9 +263,7 @@ class {name} {{
         cpp_json_defs.append(f"inline {from_json_decl} {from_json_def}")
         cpp_type_decls.append(f"class {name};")
 
-        thrift_type_defs[
-            name
-        ] = f"""
+        thrift_type_defs[name] = f"""
 struct {name} {{
 {chr(10).join(f"  {f['thrift_id']}: {f['thrift_type']} {n};" for n, f in thrift_fields.items())}
 }}"""
@@ -294,9 +306,7 @@ struct {name} {{
             ]
         )
 
-        cpp_class_defs[
-            name
-        ] = f"""
+        cpp_class_defs[name] = f"""
 class {name} {{
   struct Void {{}};
 
@@ -322,12 +332,24 @@ class {name} {{
 {from_json_branches}
   }}
 }};
+
+inline std::string_view printEnum(const {name}::Tag& e) {{
+  switch (e) {{
+{chr(10).join([f"    case {name}::Tag::{x.upper()}: return {chr(34)}{x.upper()}{chr(34)};" for x in cpp_fields])}
+    default:
+      throw std::runtime_error("Unknown enum value");
+  }}
+}}
+
+inline void parseEnum(std::string_view s, {name}::Tag& t) {{
+{chr(10).join([f"  if (s == {chr(34)}{x.upper()}{chr(34)}) {{ t = {name}::Tag::{x.upper()}; return; }}" for x in cpp_fields])}
+  throw std::runtime_error("Unknown enum value: " + std::string{{s}});
+}}
+
 """
         cpp_type_decls.append(f"class {name};")
 
-        thrift_type_defs[
-            name
-        ] = f"""
+        thrift_type_defs[name] = f"""
 union {name} {{
 {chr(10).join(f"  {f['thrift_id']}: {f['thrift_type']} {n};" for n, f in thrift_fields.items())}
 }}"""
@@ -370,6 +392,7 @@ union {name} {{
 #pragma once
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -418,13 +441,14 @@ class ForwardRef {{
 
  public:
   ForwardRef(): ptr_(std::make_unique<T>()) {{}}
-  ForwardRef(ForwardRef<T>&&) = default;
+  ForwardRef(ForwardRef<T>&&);
   ForwardRef(const ForwardRef<T>& other): ptr_(std::make_unique<T>(*other.ptr_)) {{}}
-  ForwardRef<T>& operator=(ForwardRef<T>&&) = default;
+  ForwardRef<T>& operator=(ForwardRef<T>&&);
   ForwardRef<T>& operator=(const ForwardRef<T>& other) {{
     ptr_ = std::make_unique<T>(*other.ptr_);
     return *this;
   }}
+  ~ForwardRef();
   const T& operator*() const {{
     return *ptr_;
   }}
@@ -493,6 +517,10 @@ inline void from_json(const nlohmann::json& j, F64& f) {{
 {"".join(cpp_enum_defs.values())}
 {"".join(dict(sorted(cpp_class_defs.items(), key=lambda x: class_ordering[x[0]])).values())}
 {chr(10).join(cpp_json_defs)}
+
+template <typename T> ForwardRef<T>::ForwardRef(ForwardRef<T>&&) = default;
+template <typename T> ForwardRef<T>& ForwardRef<T>::operator=(ForwardRef<T>&&) = default;
+template <typename T> ForwardRef<T>::~ForwardRef() = default;
 }} // namespace _export
 }} // namespace torch
 """
@@ -595,7 +623,9 @@ class _Commit:
 def update_schema():
     import importlib.resources
 
+    # pyrefly: ignore [bad-argument-type]
     if importlib.resources.is_resource(__package__, "schema.yaml"):
+        # pyrefly: ignore [bad-argument-type]
         content = importlib.resources.read_text(__package__, "schema.yaml")
         match = re.search("checksum<<([A-Fa-f0-9]{64})>>", content)
         _check(match is not None, "checksum not found in schema.yaml")
@@ -603,7 +633,9 @@ def update_schema():
         checksum_head = match.group(1)
 
         thrift_content = importlib.resources.read_text(
-            __package__, "export_schema.thrift"
+            # pyrefly: ignore [bad-argument-type]
+            __package__,
+            "export_schema.thrift",
         )
         match = re.search("checksum<<([A-Fa-f0-9]{64})>>", thrift_content)
         _check(match is not None, "checksum not found in export_schema.thrift")
@@ -626,7 +658,9 @@ def update_schema():
 
     src, cpp_header, thrift_schema = _staged_schema()
     additions, subtractions = _diff_schema(dst, src)
+    # pyrefly: ignore [missing-attribute]
     yaml_path = __package__.replace(".", "/") + "/schema.yaml"
+    # pyrefly: ignore [missing-attribute]
     thrift_schema_path = __package__.replace(".", "/") + "/export_schema.thrift"
     torch_prefix = "torch/"
     assert yaml_path.startswith(torch_prefix)  # sanity check
@@ -663,7 +697,7 @@ def check(commit: _Commit, force_unsafe: bool = False):
             for f, d in fields.items():
                 if kind == "struct" and "default" not in d:
                     reason += (
-                        f"Field {k}.{f} is added to schema.py without a default value as an incomparible change "
+                        f"Field {k}.{f} is added to schema.py without a default value as an incompatible change "
                         + "which requires major version bump.\n"
                     )
                     next_version = [commit.base["SCHEMA_VERSION"][0] + 1, 1]

@@ -15,7 +15,7 @@
 #if AT_BUILD_WITH_BLAS()
 #if C10_IOS
 #include <Accelerate/Accelerate.h>
-#else
+#elif !defined(_ARMPL_H)
 extern "C" void dgemm_(char *transa, char *transb, int *m, int *n, int *k, double *alpha, const double *a, int *lda, const double *b, int *ldb, double *beta, double *c, int *ldc);
 extern "C" void sgemm_(char *transa, char *transb, int *m, int *n, int *k, float *alpha, const float *a, int *lda, const float *b, int *ldb, float *beta, float *c, int *ldc);
 extern "C" void cgemm_(char *transa, char *transb, int *m, int *n, int *k, void *alpha, const void *a, int *lda, const void *b, int *ldb, void *beta, void *c, int *ldc);
@@ -28,6 +28,14 @@ extern "C" void sbgemm_(char *transa, char *transb, int *m, int *n, int *k,
                 float *beta,
                 float *c, int *ldc);
 #endif  // BLAS_HAS_SBGEMM
+#ifdef BLAS_HAS_SHGEMM
+extern "C" void shgemm_(char *transa, char *transb, int *m, int *n, int *k,
+                float *alpha,
+                const at::Half *a, int *lda,
+                const at::Half *b, int *ldb,
+                float *beta,
+                float *c, int *ldc);
+#endif  // BLAS_HAS_SHGEMM
 extern "C" void cswap_(int *n, const void *x, int *incx, void *y, int *incy);
 extern "C" void dcopy_(int *n, const double *x, int *incx, double *y, int *incy);
 extern "C" void scopy_(int *n, const float *x, int *incx, float *y, int *incy);
@@ -51,7 +59,7 @@ extern "C" void zaxpy_(int *n, void *a, const void *x, int *incx, void *y, int *
 // brgemm_pack_B is changed to transform and the setting of brgemm beta is changed to set_add_C
 #if (IDEEP_VERSION_MAJOR == 3 && IDEEP_VERSION_MINOR == 5)
 #define ONEDNN_UKERNEL_1
-#elif (IDEEP_VERSION_MAJOR >= 3 && IDEEP_VERSION_MINOR >= 6)
+#elif ((IDEEP_VERSION_MAJOR == 3 && IDEEP_VERSION_MINOR >= 6) || (IDEEP_VERSION_MAJOR > 3))
 #define ONEDNN_UKERNEL_2
 #endif
 #if ((defined(ONEDNN_UKERNEL_1) || defined(ONEDNN_UKERNEL_2)) && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC))))
@@ -135,6 +143,7 @@ CBLAS_TRANSPOSE to_apple_accelerate_transpose(TransposeType trans) {
 }  // namespace (anonymous)
 
 DEFINE_DISPATCH(gemm_stub);
+DEFINE_DISPATCH(gemm_no_downcast_stub);
 
 void gemm(
     TransposeType transa, TransposeType transb,
@@ -179,6 +188,18 @@ void gemm(
       transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 
+#ifndef armpl_doublecomplex_t
+#define COMPLEX_DBL(a) a
+#define COMPLEX_DBL_CONST(a) a
+#define COMPLEX_FLOAT(a) a
+#define COMPLEX_FLOAT_CONST(a) a
+#else
+#define COMPLEX_DBL(a) ((armpl_doublecomplex_t*)a)
+#define COMPLEX_DBL_CONST(a) ((const armpl_doublecomplex_t*)a)
+#define COMPLEX_FLOAT(a) ((armpl_singlecomplex_t*)a)
+#define COMPLEX_FLOAT_CONST(a) ((const armpl_singlecomplex_t*)a)
+#endif
+
 void gemm(
     TransposeType transa, TransposeType transb,
     int64_t m, int64_t n, int64_t k,
@@ -189,7 +210,7 @@ void gemm(
     float *c, int64_t ldc) {
   internal::normalize_last_dims(transa, transb, m, n, k, &lda, &ldb, &ldc);
 #if AT_MKLDNN_ENABLED()
-   if (mkldnn_bf32_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
+   if (mkldnn_reduced_f32_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
      return;
    }
 #endif
@@ -256,11 +277,11 @@ void gemm(
     zgemm_(
         &transa_, &transb_,
         &m_, &n_, &k_,
-        &alpha_,
-        a, &lda_,
-        b, &ldb_,
-        &beta_,
-        c, &ldc_);
+        COMPLEX_DBL_CONST(&alpha_),
+        COMPLEX_DBL_CONST(a), &lda_,
+        COMPLEX_DBL_CONST(b), &ldb_,
+        COMPLEX_DBL_CONST(&beta_),
+        COMPLEX_DBL(c), &ldc_);
     #endif
     return;
   }
@@ -299,11 +320,11 @@ void gemm(
     cgemm_(
         &transa_, &transb_,
         &m_, &n_, &k_,
-        &alpha_,
-        a, &lda_,
-        b, &ldb_,
-        &beta_,
-        c, &ldc_);
+        COMPLEX_FLOAT_CONST(&alpha_),
+        COMPLEX_FLOAT_CONST(a), &lda_,
+        COMPLEX_FLOAT_CONST(b), &ldb_,
+        COMPLEX_FLOAT_CONST(&beta_),
+        COMPLEX_FLOAT(c), &ldc_);
     #endif
     return;
   }
@@ -322,31 +343,12 @@ void gemm(
    const float beta,
    at::BFloat16 *c, int64_t ldc) {
    internal::normalize_last_dims(transa, transb, m, n, k, &lda, &ldb, &ldc);
-#if AT_BUILD_WITH_BLAS() && defined(BLAS_HAS_SBGEMM)
-   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
-      int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
-      char transa_ = to_blas(transa), transb_ = to_blas(transb);
-      float alpha_ = alpha, beta_ = beta;
-      int c_size = n_ * ldc_;
-      // C matrix in OpenBLAS sbgemm are of type "float" so we have to convert, copy and copy back.
-      std::vector<float> float_v(c, c + c_size);
-      sbgemm_(&transa_, &transb_,
-              &m_, &n_, &k_,
-              &alpha_,
-              a, &lda_,
-              b, &ldb_,
-              &beta_,
-              float_v.data(), &ldc_);
-      for (auto cv: float_v) {
-        *(c++) = c10::convert<at::BFloat16>(cv);
-      }
-      return;
-   }
-#endif
 #if AT_MKLDNN_ENABLED()
 #ifdef __aarch64__
    // MKLDNN also supports ARM for bf16, and the bypass is only
    // currently intended for x86/x86_64.
+   const bool use_bf16_gemv_trans = false;
+#elif defined(__powerpc__)
    const bool use_bf16_gemv_trans = false;
 #else
    const bool bf16_gemv_trans_would_be_faster = cpuinfo_initialize() &&
@@ -357,6 +359,34 @@ void gemm(
 #endif
    if (!use_bf16_gemv_trans && mkldnn_bf16_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
      return;
+   }
+#endif
+#if AT_BUILD_WITH_BLAS() && defined(BLAS_HAS_SBGEMM)
+   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
+      int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
+      char transa_ = to_blas(transa), transb_ = to_blas(transb);
+      float alpha_ = alpha, beta_ = beta;
+      int c_size = n_ * m_;
+      // C matrix in OpenBLAS sbgemm are of type "float" so we have to convert, copy and copy back.
+      std::vector<float> float_v(c_size, 0.0f);
+      for (const auto j : c10::irange(n)) {
+        for (const auto i : c10::irange(m)) {
+          float_v[j * m_ + i] = c10::convert<float>(c[j * ldc_ + i]);
+        }
+      }
+      sbgemm_(&transa_, &transb_,
+              &m_, &n_, &k_,
+              &alpha_,
+              a, &lda_,
+              b, &ldb_,
+              &beta_,
+              float_v.data(), &m_);
+      for (const auto j : c10::irange(n)) {
+        for (const auto i : c10::irange(m)) {
+          c[j * ldc_ + i] = c10::convert<at::BFloat16>(float_v[j * m_ + i]);
+        }
+      }
+      return;
    }
 #endif
    gemm_stub(
@@ -378,14 +408,46 @@ void gemm(
    // we should not bother checking for !cpuinfo_has_x86_avx512fp16() here,
    // because "onednn (mkldnn) won't use avx512fp16 to compute gemms by default
    // because the avx512fp16 fma would incur accuracy loss".
+#if defined(__powerpc__)
+   const bool fp16_gemv_trans_would_be_faster = false;
+#else
    const bool fp16_gemv_trans_would_be_faster = cpuinfo_initialize() &&
      cpuinfo_has_x86_f16c();
+#endif
    const bool use_fp16_gemv_trans = fp16_gemv_trans_would_be_faster &&
      transa == TransposeType::Transpose &&
      transb == TransposeType::NoTranspose && n == 1 && alpha == 1.0;
    if (!use_fp16_gemv_trans &&
        mkldnn_fp16_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
      return;
+   }
+#endif
+#if AT_BUILD_WITH_BLAS() && defined(BLAS_HAS_SHGEMM)
+   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
+      int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
+      char transa_ = to_blas(transa), transb_ = to_blas(transb);
+      float alpha_ = alpha, beta_ = beta;
+      int c_size = n_ * m_;
+      // C matrix in OpenBLAS shgemm are of type "float" so we have to convert, copy and copy back.
+      std::vector<float> float_v(c_size, 0.0f);
+      for (const auto j : c10::irange(n)) {
+        for (const auto i : c10::irange(m)) {
+          float_v[j * m_ + i] = c10::convert<float>(c[j * ldc_ + i]);
+        }
+      }
+      shgemm_(&transa_, &transb_,
+              &m_, &n_, &k_,
+              &alpha_,
+              a, &lda_,
+              b, &ldb_,
+              &beta_,
+              float_v.data(), &m_);
+      for (const auto j : c10::irange(n)) {
+        for (const auto i : c10::irange(m)) {
+          c[j * ldc_ + i] = c10::convert<at::Half>(float_v[j * m_ + i]);
+        }
+      }
+      return;
    }
 #endif
    gemm_stub(
@@ -417,6 +479,13 @@ void gemm(
       return;
    }
 #endif
+#if AT_MKLDNN_ACL_ENABLED()
+// add heuristic based on shape to dispatch to sbgemm_ vs MKLDNN
+   if (mkldnn_bf16f32_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
+     return;
+   }
+#endif //AT_MKLDNN_ACL_ENABLED
+
 #ifdef MKL_HAS_SBGEMM
   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
@@ -424,24 +493,9 @@ void gemm(
     return;
   }
 #endif
-  // for the fallback path, first compute gemm with beta = 0,
-  // and then add c in full precision.
-  int64_t c_size = n * m;
-  std::vector<at::BFloat16> bfloat_c(c_size, 0.f);
-  gemm_stub(
+  gemm_no_downcast_stub(
       at::kCPU, at::kBFloat16,
-      transa, transb, m, n, k, alpha, a, lda, b, ldb, 0.f, bfloat_c.data(), m);
-  for (const auto j : c10::irange(n)) {
-    for (const auto i : c10::irange(m)) {
-      auto offset = j * ldc + i;
-      // beta == 0 won't propagate NaN from C
-      if (beta == 0.f) {
-        c[offset] = c10::convert<float>(bfloat_c[j * m + i]);
-      } else {
-        c[offset] = beta * c[offset] + c10::convert<float>(bfloat_c[j * m + i]);
-      }
-    }
-  }
+      transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 
 void gemm(
@@ -453,6 +507,21 @@ void gemm(
     const float beta,
     float *c, int64_t ldc) {
   internal::normalize_last_dims(transa, transb, m, n, k, &lda, &ldb, &ldc);
+#if AT_BUILD_WITH_BLAS() && defined(BLAS_HAS_SHGEMM)
+  if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
+    int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
+    char transa_ = to_blas(transa), transb_ = to_blas(transb);
+    float alpha_ = alpha, beta_ = beta;
+    shgemm_(&transa_, &transb_,
+            &m_, &n_, &k_,
+            &alpha_,
+            a, &lda_,
+            b, &ldb_,
+            &beta_,
+            c, &ldc_);
+    return;
+  }
+#endif
 #ifdef MKL_HAS_SHGEMM
   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
@@ -460,24 +529,9 @@ void gemm(
     return;
   }
 #endif
-  // for the fallback path, first compute gemm with beta = 0,
-  // and then add c in full precision.
-  int64_t c_size = n * m;
-  std::vector<at::Half> float16_c(c_size, 0.f);
-  gemm_stub(
+  gemm_no_downcast_stub(
       at::kCPU, at::kHalf,
-      transa, transb, m, n, k, alpha, a, lda, b, ldb, 0.f, float16_c.data(), m);
-  for (const auto j : c10::irange(n)) {
-    for (const auto i : c10::irange(m)) {
-      auto offset = j * ldc + i;
-      // beta == 0 won't propagate NaN from C
-      if (beta == 0.f) {
-        c[offset] = c10::convert<float>(float16_c[j * m + i]);
-      } else {
-        c[offset] = beta * c[offset] + c10::convert<float>(float16_c[j * m + i]);
-      }
-    }
-  }
+      transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 
 void gemm(
@@ -548,7 +602,7 @@ using is_blas_library_type = std::integral_constant<bool,
     std::is_same_v<scalar_t, c10::complex<float>>>;
 
 template <typename scalar_t>
-void gemm_batched_generic(
+static void gemm_batched_generic(
     TransposeType transa, TransposeType transb,
     int64_t batch_size, int64_t m, int64_t n, int64_t k,
     scalar_t alpha,
@@ -562,7 +616,7 @@ void gemm_batched_generic(
 }
 
 template <typename scalar_t>
-void gemm_batched(
+static void gemm_batched(
     TransposeType transa, TransposeType transb,
     int64_t batch_size, int64_t m, int64_t n, int64_t k,
     scalar_t alpha,
@@ -590,7 +644,7 @@ void gemm_batched(
 }
 
 template <typename scalar_t>
-void gemm_batched_with_stride_generic(
+static void gemm_batched_with_stride_generic(
     TransposeType transa, TransposeType transb,
     int64_t batch_size, int64_t m, int64_t n, int64_t k,
     scalar_t alpha,
@@ -677,9 +731,9 @@ void axpy(int64_t n, double a, const double *x, int64_t incx, double *y, int64_t
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) )
   {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_daxpy(i_n, a, x, i_incx, y, i_incy);
     #else
@@ -702,9 +756,9 @@ void axpy(int64_t n, float a, const float *x, int64_t incx, float *y, int64_t in
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) )
   {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_saxpy(i_n, a, x, i_incx, y, i_incy);
     #else
@@ -727,13 +781,13 @@ void axpy(int64_t n, c10::complex<double> a, const c10::complex<double> *x, int6
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) )
   {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_zaxpy(i_n, &a, x, i_incx, y, i_incy);
     #else
-    zaxpy_(&i_n, &a, x, &i_incx, y, &i_incy);
+    zaxpy_(&i_n, COMPLEX_DBL(&a), COMPLEX_DBL_CONST(x), &i_incx, COMPLEX_DBL(y), &i_incy);
     #endif
     return;
   }
@@ -752,13 +806,13 @@ void axpy(int64_t n, c10::complex<float> a, const c10::complex<float> *x, int64_
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) )
   {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_caxpy(i_n, &a, x, i_incx, y, i_incy);
     #else
-    caxpy_(&i_n, &a, x, &i_incx, y, &i_incy);
+    caxpy_(&i_n, COMPLEX_FLOAT(&a), COMPLEX_FLOAT_CONST(x), &i_incx, COMPLEX_FLOAT(y), &i_incy);
     #endif
     return;
   }
@@ -778,9 +832,9 @@ void copy(int64_t n, const double *x, int64_t incx, double *y, int64_t incy) {
   }
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) ) {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_dcopy(i_n, x, i_incx, y, i_incy);
     #else
@@ -802,9 +856,9 @@ void copy(int64_t n, const float *x, int64_t incx, float *y, int64_t incy) {
   }
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) ) {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_scopy(i_n, x, i_incx, y, i_incy);
     #else
@@ -826,13 +880,13 @@ void copy(int64_t n, const c10::complex<double> *x, int64_t incx, c10::complex<d
   }
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) ) {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_zcopy(i_n, x, i_incx, y, i_incy);
     #else
-    zcopy_(&i_n, x, &i_incx, y, &i_incy);
+    zcopy_(&i_n, COMPLEX_DBL_CONST(x), &i_incx, COMPLEX_DBL(y), &i_incy);
     #endif
     return;
   }
@@ -850,13 +904,13 @@ void copy(int64_t n, const c10::complex<float> *x, int64_t incx, c10::complex<fl
   }
   #if AT_BUILD_WITH_BLAS()
   if( (n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX) ) {
-    int i_n = (int)n;
-    int i_incx = (int)incx;
-    int i_incy = (int)incy;
+    int i_n = static_cast<int>(n);
+    int i_incx = static_cast<int>(incx);
+    int i_incy = static_cast<int>(incy);
     #if C10_IOS
     cblas_ccopy(i_n, &x, i_incx, y, i_incy);
     #else
-    ccopy_(&i_n, x, &i_incx, y, &i_incy);
+    ccopy_(&i_n, COMPLEX_FLOAT(x), &i_incx, COMPLEX_FLOAT(y), &i_incy);
     #endif
     return;
   }
@@ -939,7 +993,7 @@ struct PackKey {
   }
 };
 
-inline dnnl::memory::data_type get_dnnl_dtype(ScalarType dtype) {
+static inline dnnl::memory::data_type get_dnnl_dtype(ScalarType dtype) {
   if (dtype == ScalarType::Float) {
     return dnnl::memory::data_type::f32;
   } else if (dtype == ScalarType::BFloat16) {
@@ -988,7 +1042,7 @@ std::size_t UnsafeUkernelKeyHasher<PackKey>::operator()(const PackKey& key) cons
 template <typename key_t, typename value_t>
 struct KernelCache  {
   using kstore_t = std::unordered_map<key_t, std::shared_ptr<value_t>, UnsafeUkernelKeyHasher<key_t>>;
-  static inline std::shared_ptr<value_t>&& fetch_or_create(
+  static std::shared_ptr<value_t>&& fetch_or_create(
       const key_t& key,
       const std::function<std::shared_ptr<value_t>()>& callback) {
     auto&& search = get_store().find(key);
@@ -1000,7 +1054,7 @@ struct KernelCache  {
     }
   }
 
-  static inline kstore_t& get_store() {
+  static kstore_t& get_store() {
     static thread_local kstore_t cache_kernels;
     return cache_kernels;
   }
@@ -1064,7 +1118,7 @@ struct GemmHelper {
 struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
   // Fetch/create GemmHelper object and execute brgemm with batch size = 1
   template <typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
-  static inline void call(
+  static void call(
       int64_t M,
       int64_t N,
       int64_t K,
@@ -1079,7 +1133,7 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
         M,
         N,
         K,
-        int64_t(1),
+        1,
         ld_a,
         ld_b,
         ld_c,
@@ -1093,7 +1147,7 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
           M,
           N,
           K,
-          int64_t(1),
+          1,
           ld_a,
           ld_b,
           ld_c,
@@ -1115,12 +1169,12 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
         .execute(A, B, (*value).A_B_offsets, C, (*value).scratchpad.data());
   }
 
-  static inline std::shared_ptr<GemmHelper>& get_current() {
+  static std::shared_ptr<GemmHelper>& get_current() {
     static thread_local std::shared_ptr<GemmHelper> current;
     return current;
   }
 
-  static inline bool device_check(ScalarType dtype) {
+  static bool device_check(ScalarType dtype) {
     if (!at::globalContext().userEnabledMkldnn()) {
       return false;
     }
@@ -1150,7 +1204,7 @@ using pack_t = dnnl::ukernel::brgemm_pack_B;
 using pack_t = dnnl::ukernel::transform;
 #endif
 struct Pack : public KernelCache <PackKey, pack_t> {
-  static inline void call(
+  static void call(
       int64_t K,
       int64_t N,
       int64_t ld_in,
@@ -1179,7 +1233,7 @@ struct Pack : public KernelCache <PackKey, pack_t> {
     }
   }
 
-  static inline bool could_pack(ScalarType dtype) {
+  static bool could_pack(ScalarType dtype) {
     if (!at::globalContext().userEnabledMkldnn()) {
       return false;
     }
@@ -1332,6 +1386,30 @@ void brgemm(
 #if defined(ONEDNN_UKERNEL_ENABLED)
   if (is_vnni && Brgemm::device_check(ScalarType::Char)) {
     Brgemm::call<unsigned char, signed char, int32_t>(
+      M, N, K, ld_a, ld_b, ld_c, add_C, A, B, C);
+    return;
+  }
+#endif
+  // raise an error if the path is not supported
+  TORCH_CHECK(false,
+    "I8 Brgemm is only supported on X64 when oneDNN ukernel is enabled and `amx` is supported");
+}
+
+void brgemm(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const bool add_C,
+    const signed char* A,
+    const signed char* B,
+    int32_t* C,
+    bool is_vnni) {
+#if defined(ONEDNN_UKERNEL_ENABLED)
+  if (is_vnni && Brgemm::device_check(ScalarType::Char)) {
+    Brgemm::call<signed char, signed char, int32_t>(
       M, N, K, ld_a, ld_b, ld_c, add_C, A, B, C);
     return;
   }

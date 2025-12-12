@@ -3,9 +3,9 @@ from torch._inductor.runtime.benchmarking import benchmarker
 
 
 def create_blocked_tensor(B, M, N, blocksize, sparsity, dtype, device):
-    assert (
-        sparsity <= 1.0 and sparsity >= 0.0
-    ), "sparsity should be a value between 0 and 1"
+    assert sparsity <= 1.0 and sparsity >= 0.0, (
+        "sparsity should be a value between 0 and 1"
+    )
     assert M % blocksize[0] == 0
     assert N % blocksize[1] == 0
     shape = (B, M // blocksize[0], N // blocksize[1])[int(B == 0) :]
@@ -179,10 +179,13 @@ if __name__ == "__main__":
 
     if args.outfile == "stdout":
         outfile = sys.stdout
+        need_close = False
     elif args.outfile == "stderr":
         outfile = sys.stderr
+        need_close = False
     else:
-        outfile = open(args.outfile, "a")
+        outfile = open(args.outfile, "a")  # noqa: SIM115
+        need_close = True
 
     ops = args.ops.split(",")
 
@@ -434,3 +437,5 @@ if __name__ == "__main__":
                 if op not in {"bsr_scatter_mm6", "bsr_dense_mm_with_meta"}:
                     # Break on operations that do not consume parameters
                     break
+    if need_close:
+        outfile.close()

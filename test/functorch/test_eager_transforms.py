@@ -71,9 +71,9 @@ from torch.testing._internal.common_utils import (
     markDynamoStrictTest,
     parametrize,
     run_tests,
-    skipIfRocm,
     skipIfTorchDynamo,
     subtest,
+    TEST_CUDA_MEM_LEAK_CHECK,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
     xfailIfTorchDynamo,
@@ -312,6 +312,24 @@ class TestGradTransform(TestCase):
 
     def test_numel(self, device):
         self._test_attributes(lambda x: x.numel(), device)
+
+    def test_layout_sparse(self, device):
+        indices = torch.tensor([[0, 1, 1], [2, 0, 2]], device=device)
+        values = torch.tensor([3.0, 4.0, 5.0], device=device)
+        sparse_x = torch.sparse_coo_tensor(indices, values, (2, 3), device=device)
+
+        # Verify the input is sparse
+        self.assertEqual(sparse_x.layout, torch.sparse_coo)
+
+        def foo(x):
+            # assert GradTrackingTensor still reports sparse layout
+            self.assertEqual(x.layout, torch.sparse_coo)
+            return x.coalesce()._values().sum()
+
+        result = grad(foo)(sparse_x)
+
+        # The gradient should also be sparse
+        self.assertEqual(result.layout, torch.sparse_coo)
 
     def test_inplace(self, device):
         x = torch.randn([], device=device)
@@ -686,7 +704,7 @@ class TestGradTransform(TestCase):
         expected = (torch.zeros_like(x), torch.ones_like(x))
         self.assertEqual(result, expected)
 
-    # TODO: https://github.com/zou3519/functorch/issues/12
+    # TODO: https://github.com/pytorch/functorch/issues/12
     @onlyCPU
     def test_unrelated_hessian(self, device):
         N = 5
@@ -960,23 +978,21 @@ class TestGradTransform(TestCase):
                 fn = foo
                 bdim = 0
                 for op in reversed(op_list):
-                    if op == vmap:
+                    if op is vmap:
                         fn = op(fn, in_dims=bdim)
                         bdim += 1
                     else:
                         fn = op(fn)
 
                 expected = f"{repr(x)}"
-                level = 0
-                for op in op_list:
-                    level += 1
-                    if op == grad:
-                        expected = f"GradTrackingTensor(lvl={level}, value={expected})"
-                    elif op == vmap:
-                        bdim -= 1
+                for level, op in enumerate(op_list):
+                    if op is grad:
                         expected = (
-                            f"BatchedTensor(lvl={level}, bdim={bdim}, value={expected})"
+                            f"GradTrackingTensor(lvl={level + 1}, value={expected})"
                         )
+                    elif op is vmap:
+                        bdim -= 1
+                        expected = f"BatchedTensor(lvl={level + 1}, bdim={bdim}, value={expected})"
 
                 fn(x)
                 buf = buf.replace("\n", "").replace("  ", "")
@@ -2865,6 +2881,10 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_jvp, expected_jvp)
 
     @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_linearize_return(self, device, dtype):
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
@@ -2879,6 +2899,10 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_jvp, expected_jvp)
 
     @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_linearize_composition_vmap(self, device, dtype):
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 3, 1), device=device, dtype=dtype)
@@ -2897,6 +2921,10 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_batched_jvp, expected_batched_jvp)
 
     @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_linearize_composition_grad(self, device, dtype):
         x_p = make_tensor((3,), device=device, dtype=dtype)
         x_t = make_tensor((3,), device=device, dtype=dtype)
@@ -2916,6 +2944,10 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_batched_jvp, expected_batched_jvp)
 
     @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_linearize_nested_input_nested_output(self, device, dtype):
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
@@ -4307,9 +4339,7 @@ class TestExamplesCorrectness(TestCase):
 
         def lennard_jones_force(r):
             """Get magnitude of LJ force"""
-            return -epsilon * (
-                (-12 * sigma**12 / r**13) + (6 * sigma**6 / r**7)
-            )
+            return -epsilon * ((-12 * sigma**12 / r**13) + (6 * sigma**6 / r**7))
 
         r = torch.linspace(0.5, 2 * sigma, steps=100, requires_grad=True, device=device)
         drs = torch.outer(r, torch.tensor([1.0, 0, 0], device=device))
@@ -4478,8 +4508,9 @@ class TestExamplesCorrectness(TestCase):
         # This example mimics what a user might do when trying to find the optimal learning rate. They would
         # want to run a bunch of models with the same behavior (including the same dropout!) and have them
         # each run with different learning rates. Specifically, this is an example of using same randomness with vmap
-        points, labels = torch.randn(100, 2, 2, 2, 2, device=device), torch.randint(
-            0, 2, (100,), device=device
+        points, labels = (
+            torch.randn(100, 2, 2, 2, 2, device=device),
+            torch.randint(0, 2, (100,), device=device),
         )
 
         class MLPClassifier(nn.Module):
@@ -5147,10 +5178,13 @@ def traceable(f):
 
 @markDynamoStrictTest
 class TestCompileTransforms(TestCase):
-    @skipIfRocm(msg="test leaks memory on ROCm")
     # torch.compile is not supported on Windows CUDA.
     # Triton only supports GPU with SM70 or later.
     @expectedFailureIf((IS_WINDOWS and TEST_CUDA) or (TEST_CUDA and not SM70OrLater))
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_compile_vmap_hessian(self, device):
         # The model and inputs are a smaller version
         # of code at benchmark repo:
@@ -5202,6 +5236,101 @@ class TestCompileTransforms(TestCase):
         actual = wrapper_fn(x, y)
         expected = torch.compile(wrapper_fn, backend="eager", fullgraph=True)(x, y)
         self.assertEqual(actual, expected)
+
+
+class TestGradTrackingTensorToList(TestCase):
+    """Tests for tolist() method with GradTrackingTensor (functorch tensors)."""
+
+    def test_tolist_with_grad(self):
+        """Test to see if tolist works inside grad transformation."""
+
+        def f(x):
+            # inside grad, x is a GradTrackingTensor
+            result = x.tolist()
+            # tolist should return a python list and not fail
+            self.assertIsInstance(result, list)
+            self.assertEqual(result, [1.0, 2.0, 3.0])
+            return (x**2).sum()
+
+        x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        self.assertIsInstance(result, torch.Tensor)
+        # gradients should still be computed correctly
+        self.assertEqual(result, [2.0, 4.0, 6.0])
+
+    def test_tolist_nested_grad(self):
+        """Test `tolist` with nested grad transformations."""
+
+        def f(x):
+            def g(y):
+                # y is gradTrackingTensor(lvl=1)
+                inner_list = y.tolist()
+                self.assertIsInstance(inner_list, list)
+                return (y**2).sum()
+
+            # x is a gradTrackingTensor(lvl=0)
+            outer_list = x.tolist()
+            self.assertIsInstance(outer_list, list)
+            grad_g = torch.func.grad(g)
+            return grad_g(x).sum()
+
+        x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        # should compute second derivate
+        self.assertIsInstance(result, torch.Tensor)
+        # grad_f should return the derivate of g(y) which is (2*x).sum
+        self.assertEqual(
+            result,
+            [
+                2.0,
+                2.0,
+                2.0,
+            ],
+        )
+
+    def test_tolist_multidimensional_grad(self):
+        """Test tolist with multi-dimensional tensors in grad."""
+
+        def f(x):
+            result = x.tolist()
+            self.assertIsInstance(result, list)
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            return x.sum()
+
+        x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertEqual(
+            result,
+            [
+                [
+                    1.0,
+                    1.0,
+                    1.0,
+                ],
+                [1.0, 1.0, 1.0],
+            ],
+        )
+
+    def test_tolist_conj_neg_grad(self):
+        """Test tolist method with conjugate/negative tensors in grad context."""
+
+        def f(x):
+            # test with the conjugate view
+            x_conj = x.conj()
+            result_conj = x_conj.tolist()
+            self.assertIsInstance(result_conj, list)
+            return (x * x.conj()).real.sum()
+
+        x = torch.tensor([1.0 + 2.0j, 3.0 + 4.0j], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertEqual(result, [2.0 + 4.0j, 6.0 + 8.0j])
 
 
 only_for = ("cpu", "cuda")
@@ -5282,6 +5411,9 @@ instantiate_device_type_tests(
     TestCompileTransforms,
     globals(),
     only_for=only_for,
+)
+instantiate_device_type_tests(
+    TestGradTrackingTensorToList, globals(), only_for=only_for
 )
 
 if __name__ == "__main__":

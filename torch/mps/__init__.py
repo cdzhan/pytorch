@@ -5,7 +5,6 @@ Metal is Apple's API for programming metal GPU (graphics processor unit). Using 
 performance can be achieved, by running work on the metal GPU(s).
 See https://developer.apple.com/documentation/metalperformanceshaders for more details.
 """
-from typing import Union
 
 import torch
 from torch import Tensor
@@ -33,7 +32,7 @@ def synchronize() -> None:
     return torch._C._mps_deviceSynchronize()
 
 
-def get_rng_state(device: Union[int, str, torch.device] = "mps") -> Tensor:
+def get_rng_state(device: int | str | torch.device = "mps") -> Tensor:
     r"""Returns the random number generator state as a ByteTensor.
 
     Args:
@@ -43,9 +42,7 @@ def get_rng_state(device: Union[int, str, torch.device] = "mps") -> Tensor:
     return _get_default_mps_generator().get_state()
 
 
-def set_rng_state(
-    new_state: Tensor, device: Union[int, str, torch.device] = "mps"
-) -> None:
+def set_rng_state(new_state: Tensor, device: int | str | torch.device = "mps") -> None:
     r"""Sets the random number generator state.
 
     Args:
@@ -140,13 +137,13 @@ def recommended_max_memory() -> int:
     return torch._C._mps_recommendedMaxMemory()
 
 
-def _compile_shader(source: str):
+def compile_shader(source: str):
     r"""Compiles compute shader from source and allows one to invoke kernels
     defined there from the comfort of Python runtime
     Example::
 
         >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_MPS)
-        >>> lib = torch.mps._compile_shader(
+        >>> lib = torch.mps.compile_shader(
         ... "kernel void full(device float* out, constant float& val, uint idx [[thread_position_in_grid]]) { out[idx] = val; }"
         ...  )
         >>> x = torch.zeros(16, device="mps")
@@ -175,6 +172,7 @@ from .event import Event
 
 
 __all__ = [
+    "compile_shader",
     "device_count",
     "get_rng_state",
     "manual_seed",

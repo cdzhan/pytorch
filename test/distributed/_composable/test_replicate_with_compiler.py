@@ -3,8 +3,9 @@
 import contextlib
 import functools
 import unittest
+from collections.abc import Callable
 from copy import deepcopy
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -28,11 +29,10 @@ from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import (
     DistributedTestBase,
     skip_if_lt_x_gpu,
-    skip_if_rocm_multiprocess,
     sm_is_or_higher_than,
 )
 from torch.testing._internal.common_fsdp import get_devtype
-from torch.testing._internal.common_utils import run_tests, skipIfRocm
+from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.testing._internal.inductor_utils import HAS_GPU
 from torch.utils.checkpoint import checkpoint
@@ -97,12 +97,10 @@ class ReplicateTest(MultiProcessInductorTestCase):
         device: Union[str, torch.device],
     ):
         self.create_pg(device)
-        torch._dynamo.config.optimize_ddp = (
-            "python_reducer_without_compiled_forward"
-            if no_compile_forward
-            else "python_reducer"
-        )
+        torch._dynamo.config.optimize_ddp = "python_reducer"
         torch.manual_seed(123)
+        if device_type == "xpu":
+            torch.use_deterministic_algorithms(True, warn_only=True)
         model = Net(checkpoint=checkpoint).to(device)
         input = torch.randn([1, DIM], device=device)
 
@@ -198,7 +196,6 @@ class ReplicateTest(MultiProcessInductorTestCase):
         self._test_compile(no_sync=True, device="cpu")
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     @torch._inductor.config.patch(
         reorder_for_locality=False, reorder_for_peak_memory=False
@@ -207,7 +204,6 @@ class ReplicateTest(MultiProcessInductorTestCase):
         self._test_compile(no_sync=False, checkpoint=False, device=device_type)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     @torch._inductor.config.patch(
         reorder_for_locality=False, reorder_for_peak_memory=False
@@ -216,11 +212,13 @@ class ReplicateTest(MultiProcessInductorTestCase):
         self._test_compile(no_sync=False, checkpoint=True, device=device_type)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_compile_bf16(self):
         # Check device capability wrt bf16
-        if not sm_is_or_higher_than(torch.device(device_type), 8, 0):
+        if (
+            not sm_is_or_higher_than(torch.device(device_type), 8, 0)
+            and torch.version.hip is None
+        ):
             self.skipTest("bf16 requires sm >= 8.0")
 
         def setup(model, compiled_replicate_model, compiled_ddp_model) -> None:
@@ -234,7 +232,6 @@ class ReplicateTest(MultiProcessInductorTestCase):
         self._test_compile(no_sync=False, setup_func=setup, device=device_type)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_compile_fp16(self):
         def setup(model, compiled_replicate_model, compiled_ddp_model) -> None:
@@ -251,7 +248,6 @@ class ReplicateTest(MultiProcessInductorTestCase):
         )
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_compile_backward_only(self):
         self._test_compile(no_sync=False, no_compile_forward=True, device=device_type)
@@ -391,7 +387,6 @@ class DDP_TP_Test(InductorTestCase):
         "Temporarily disabled due to SymInt error: `unhashable type: non-nested SymInt`"
     )
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @skipIfRocm
     def test_ddp_tp(self):
         ref_model = Net()
         compiled_replicate_model = deepcopy(ref_model)
@@ -422,7 +417,7 @@ class DDP_TP_Test(InductorTestCase):
             # https://github.com/pytorch/pytorch/issues/127797#issuecomment-2291695474
             with self.assertRaisesRegex(
                 AssertionError,
-                "Expected ProxyTensor, got <class 'torch.distributed._tensor.api.DTensor'>",
+                "Expected ProxyTensor, got <class 'torch.distributed.tensor.DTensor'>",
             ):
                 loss.backward()
 

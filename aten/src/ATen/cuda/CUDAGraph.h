@@ -2,20 +2,10 @@
 
 #include <ATen/Tensor.h>
 #include <c10/core/Device.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/flat_hash_map.h>
-
-#include <limits>
-#include <stack>
-
-#if defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
-// this type is not defined until CUDA 12.4, but we use it as a
-// parameter type and return type in some below functions, so we give
-// it the same definition as in CUDA 12.4.
-typedef unsigned long long cudaGraphConditionalHandle;
-#endif // defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
 
 namespace at {
 
@@ -25,40 +15,14 @@ struct CUDAGeneratorState;
 
 namespace cuda {
 
-using UniquePtrExternalCudaStream =
-    std::unique_ptr<cudaStream_t, void (*)(cudaStream_t*)>;
-
 // Standalone way to get a unique mempool id usable as a pool=... argument
 // to CUDAGraph::capture_begin
 TORCH_CUDA_CPP_API MempoolId_t graph_pool_handle();
 
 struct TORCH_CUDA_CPP_API CUDAGraph {
-  CUDAGraph();
+  CUDAGraph(bool keep_graph=false);
   ~CUDAGraph();
 
-  // Copy and move constructors and assignments are disabled. These
-  // were disabled because pybind11 believed that CUDAGraph was copy
-  // constructable because
-  // pybind11::is_copy_constructible<CUDAGraph>::value originally
-  // evaluated to true. However, it cannot generate a copy constructor
-  // because CUDAGeneratorState, one of CUDAGraph's members, is an
-  // incomplete type unless CUDAGeneratorImpl.h is included. However,
-  // that would create a circular dependency between
-  // CUDAGeneratorImpl.h and CUDAGraph.h. Disabling the copy and move
-  // constructors is the most straightforward way to prevent pybind11
-  // from trying to generate default implementations of them.
-  //
-  // We needed pybind11 to return a reference to a CUDAGraph as part
-  // of wrapping CUDAGraph::get_currently_capturing_graph, which
-  // unearthed the above problem.
-  CUDAGraph(const CUDAGraph&) = delete;
-  CUDAGraph& operator=(const CUDAGraph&) = delete;
-  CUDAGraph(CUDAGraph&& other) = delete;
-  CUDAGraph& operator=(CUDAGraph&& other) = delete;
-
-  static void inc_pending_event_queries();
-  static void dec_pending_event_queries();
-  static int num_pending_event_queries();
   // See Note [Explicit Registration of Generators to the CUDA Graph]
   void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state);
   void register_generator_state(const at::Generator& generator);
@@ -66,42 +30,33 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
       MempoolId_t pool = {0, 0},
       cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
   void capture_end();
+  void instantiate();
   void replay();
   void reset();
   MempoolId_t pool();
   void enable_debug_mode();
   void debug_dump(const std::string& debug_path);
-
-  static CUDAGraph* get_currently_capturing_graph();
-  void begin_capture_to_if_node(const Tensor& scalar_cuda_pred_tensor);
-  cudaGraphConditionalHandle begin_capture_to_while_loop_node(
-      const Tensor& scalar_cuda_pred_tensor);
-  void end_capture_to_conditional_node();
-  static void set_conditional_handle(
-      cudaGraphConditionalHandle handle,
-      const Tensor& scalar_cuda_pred_tensor);
-
- private:
-  std::function<bool(cudaStream_t)> create_allocate_filter();
-  std::function<bool(cudaStream_t)> create_child_allocate_filter();
+  cudaGraph_t raw_cuda_graph();
+  cudaGraphExec_t raw_cuda_graph_exec();
 
  protected:
   cudaGraph_t graph_ = nullptr;
   cudaGraphExec_t graph_exec_ = nullptr;
 
-  static std::atomic<int> pending_event_queries;
-
   // internal states so reset() can do its best cleaning up
+
   // Set to true in capture_end if cudaStreamEndCapture succeeded
-  // Set back to false soon after, when graph_ is consumed by cudaGraphInstantiate
-  // to create graph_exec_, then graph_ is deleted
+  // Set back to false after instantiate() unless keep_graph=True or
+  // enable_debug_mode() was called on any CUDAGraph instance.
   bool has_graph_ = false;
+  // Set to true in capture_end if cudaStreamEndCapture succeeded
+  bool capture_ended_ = false;
   // Set to true in capture_end if cudaGraphInstantiate succeeded
   bool has_graph_exec_ = false;
 
   // the ID assigned by cuda during graph capture,
   // used to identify when a stream is participating in capture
-  CaptureId_t capture_id_ = std::numeric_limits<CaptureId_t>::max();
+  CaptureId_t capture_id_ = 0;
 
   // uuid used to request a particular private mempool from CUDACachingAllocator.
   // By default, this will be set to {id_, 0}.
@@ -133,14 +88,7 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   static constexpr c10::DeviceIndex UNDEFINED_DEVICE = -1;
   c10::DeviceIndex capture_dev_{UNDEFINED_DEVICE};
 
-  cudaStreamCaptureMode capture_mode_{};
-
-#if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
-  std::stack<std::pair<at::cuda::CUDAStreamGuard, UniquePtrExternalCudaStream>>
-      conditional_node_streams_;
-  std::stack<CaptureId_t> conditional_graph_capture_streams_ids_;
-  std::vector<cudaGraph_t> descendent_graphs_;
-#endif // !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
+  bool keep_graph_;
 };
 
 } // namespace cuda

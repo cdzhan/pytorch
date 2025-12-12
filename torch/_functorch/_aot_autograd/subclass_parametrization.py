@@ -1,6 +1,7 @@
 import dataclasses
 import itertools
-from typing import Any, Iterable, Union
+from collections.abc import Iterable
+from typing import Any, Union
 
 import torch
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
@@ -89,6 +90,7 @@ def unwrap_tensor_subclass_parameters(module: torch.nn.Module) -> torch.nn.Modul
     """
     for name, tensor in itertools.chain(
         list(module.named_parameters(recurse=False)),
+        # pyrefly: ignore [no-matching-overload]
         list(module.named_buffers(recurse=False)),
     ):
         if is_traceable_wrapper_subclass(tensor):
@@ -96,7 +98,7 @@ def unwrap_tensor_subclass_parameters(module: torch.nn.Module) -> torch.nn.Modul
                 module, name, UnwrapTensorSubclass()
             )
 
-    for name, child in module.named_children():
+    for child in module.children():
         unwrap_tensor_subclass_parameters(child)
 
     return module

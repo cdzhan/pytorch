@@ -1,7 +1,6 @@
 #include <ATen/core/functional.h>
 #include <ATen/core/interned_strings.h>
 #include <c10/core/MemoryFormat.h>
-#include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/ir/ir_views.h>
@@ -69,7 +68,7 @@ static std::map<int64_t, Value*> InsertSymbolicShapesCompute(
   return sym_shape_to_enclosing_graph_value;
 }
 
-void insertDynamicShapesGuard(
+static void insertDynamicShapesGuard(
     const ShapeComputeGraphMapping& shape_mapping,
     Node* guarded_node,
     bool add_composed_op,
@@ -115,7 +114,7 @@ StrideInput strideInputFromString(const std::string& si) {
 // in the runtime guard, strides are serialized as one flat
 // vector. stride_inputs_offset indexes into that vector
 // where the strides of this tensor begin
-inline StrideInput summarizeStrideDim(
+static inline StrideInput summarizeStrideDim(
     const c10::IntArrayRef sizes,
     const c10::IntArrayRef strides,
     size_t dim,
@@ -517,7 +516,7 @@ static Operation StaticRuntimeCopyOuts(const Node* node) {
   };
 }
 
-RegisterOperators SRCopyOuts({
+static RegisterOperators SRCopyOuts({
     torch::jit::Operator(
         prim::StaticRuntimeCopyOuts,
         StaticRuntimeCopyOuts,
@@ -529,7 +528,7 @@ RegisterOperators SRCopyOuts({
 // and also the that the symbolic shape dimensions are observed.
 // For any symbolic dimension we need to set its value on its first
 // use and for all subsequent uses check that the values are equal
-RegisterOperators reg_guard({
+static RegisterOperators reg_guard({
     Operator(
         "prim::TensorExprDynamicGuard(...) -> bool",
         [](const Node* node) -> Operation {
@@ -736,7 +735,7 @@ static Operation createTensorExprDynamicGroup(const Node* node) {
   };
 }
 
-RegisterOperators TensorExprDynamicOp({
+static RegisterOperators TensorExprDynamicOp({
     torch::jit::Operator(
         prim::TensorExprDynamicGroup,
         createTensorExprDynamicGroup,

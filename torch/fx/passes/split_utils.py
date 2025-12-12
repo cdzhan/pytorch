@@ -17,7 +17,12 @@ __all__ = ["getattr_recursive", "setattr_recursive", "Component", "split_by_tags
 @compatibility(is_backward_compatible=False)
 def getattr_recursive(obj, name):
     for layer in name.split("."):
-        if hasattr(obj, layer):
+        if isinstance(obj, torch.nn.ModuleList):
+            if hasattr(obj, "_modules") and layer in obj._modules:
+                obj = obj._modules[layer]
+            else:
+                return None
+        elif hasattr(obj, layer):
             obj = getattr(obj, layer)
         else:
             return None
@@ -199,9 +204,9 @@ def split_by_tags(
         mx = max((c.order for c in upstream_components), default=0)
 
         # Expect the component for `node` has higher order then its upstream components.
-        assert (
-            comp.order >= mx
-        ), f"Component {comp.name} order must be >= max of its upstream components, order={comp.order} and max={mx}"
+        assert comp.order >= mx, (
+            f"Component {comp.name} order must be >= max of its upstream components, order={comp.order} and max={mx}"
+        )
 
         # Map a input of `node` to nodes in the component's graph.
         def remap_func(x):
@@ -212,6 +217,7 @@ def split_by_tags(
                     comp.getattr_maps[x] = comp.graph.get_attr(
                         x.target, type_expr=x.type
                     )
+                    comp.getattr_maps[x].meta = copy.copy(x.meta)
                 return comp.getattr_maps[x]
 
             # If input is not a placeholder, it should have been put into a component

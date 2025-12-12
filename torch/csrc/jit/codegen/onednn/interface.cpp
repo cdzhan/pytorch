@@ -8,8 +8,6 @@
 #include <torch/csrc/jit/codegen/onednn/layout_propagation.h>
 #include <torch/csrc/jit/codegen/onednn/prepare_binary.h>
 #include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/decompose_ops.h>
-#include <torch/csrc/jit/passes/pass_manager.h>
 #include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include <torch/csrc/jit/runtime/custom_operator.h>
@@ -104,7 +102,7 @@ static Operation createLlgaKernel(const Node* node) {
   };
 }
 
-RegisterOperators oneDNNFusionGroupOp({
+static RegisterOperators oneDNNFusionGroupOp({
     torch::jit::Operator(
         prim::oneDNNFusionGroup,
         createLlgaKernel,
@@ -169,7 +167,7 @@ static Operation createLlgaGuardKernel(const Node* node) {
   };
 }
 
-RegisterOperators oneDNNGuardOp({
+static RegisterOperators oneDNNGuardOp({
     torch::jit::Operator(
         prim::oneDNNFusionGuard,
         createLlgaGuardKernel,

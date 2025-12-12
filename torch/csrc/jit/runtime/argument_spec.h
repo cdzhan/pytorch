@@ -101,7 +101,7 @@ struct ArgumentSpec {
     const at::Tensor* t = reinterpret_cast<const at::Tensor*>(&input);
     arg.defined_ = t->defined();
     if (arg.defined_) {
-      arg.requires_grad_ = with_grad && autograd::Variable(*t).requires_grad();
+      arg.requires_grad_ = with_grad && t->requires_grad();
       arg.dim_ = t->dim();
       at::Device device = t->device();
       arg.dev_type_ =
@@ -240,8 +240,8 @@ struct CompleteArgumentInfo;
 
 struct CompleteArgumentSpec {
   CompleteArgumentSpec(bool with_grad, at::ArrayRef<IValue> inputs)
-      : hash_code(0), ninputs(inputs.size()) {
-    int32_t all_dims = 0;
+      : ninputs(inputs.size()) {
+    int64_t all_dims = 0;
     const auto num_inputs = inputs.size();
     for (const auto i : c10::irange(num_inputs)) {
       if (!inputs[i].isTensor())
@@ -325,7 +325,7 @@ struct CompleteArgumentSpec {
   int64_t* sizes_strides() {
     return data.data() + ninputs;
   }
-  size_t hash_code; // precomputed on construction
+  size_t hash_code{0}; // precomputed on construction
   size_t ninputs;
   // layout is ninputs of TensorPOD (each 64-bit) followed by their size and
   // stride info for 3 tensors:
@@ -402,12 +402,12 @@ inline std::ostream& operator<<(std::ostream& out, const ArgumentInfo& info) {
   }
   out << "Tensor(device=" << info.device() << ", type=" << toString(info.type())
       << ", requires_grad=" << info.requires_grad() << ", dims=" << info.dim()
-      << ")";
+      << ')';
   return out;
 }
 
 inline std::ostream& operator<<(std::ostream& out, const ArgumentSpec& spec) {
-  out << "{";
+  out << '{';
   for (const auto i : c10::irange(spec.numTensors())) {
     if (i > 0)
       out << ", ";
@@ -419,7 +419,7 @@ inline std::ostream& operator<<(std::ostream& out, const ArgumentSpec& spec) {
       out << ", ";
     out << spec.isPresent(i);
   }
-  out << "}";
+  out << '}';
   return out;
 }
 
@@ -431,20 +431,20 @@ inline std::ostream& operator<<(
   }
   out << "Tensor(device=" << info.device() << ", type=" << toString(info.type())
       << ", requires_grad=" << info.requires_grad()
-      << ", sizes=" << info.sizes() << ", strides=" << info.strides() << ")";
+      << ", sizes=" << info.sizes() << ", strides=" << info.strides() << ')';
   return out;
 }
 
 inline std::ostream& operator<<(
     std::ostream& out,
     const CompleteArgumentSpec& spec) {
-  out << "{";
+  out << '{';
   for (const auto i : c10::irange(spec.size())) {
     if (i > 0)
       out << ", ";
     out << spec.at(i);
   }
-  out << "}";
+  out << '}';
   return out;
 }
 
@@ -454,8 +454,8 @@ inline CompleteArgumentInfo CompleteArgumentSpec::at(size_t i) const {
 
 inline std::optional<int8_t> convertOptional(
     std::optional<c10::ScalarType> const& from) {
-  return (from) ? std::optional<int8_t>(static_cast<int8_t>(*from))
-                : std::optional<int8_t>{};
+  return from ? std::optional<int8_t>(static_cast<int8_t>(*from))
+              : std::optional<int8_t>{};
 }
 
 } // namespace torch::jit

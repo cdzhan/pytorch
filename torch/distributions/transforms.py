@@ -3,11 +3,14 @@ import functools
 import math
 import operator
 import weakref
-from typing import Optional
+from collections.abc import Sequence
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 from torch.distributions import constraints
+from torch.distributions.distribution import Distribution
 from torch.distributions.utils import (
     _sum_rightmost,
     broadcast_all,
@@ -92,7 +95,7 @@ class Transform:
     domain: constraints.Constraint
     codomain: constraints.Constraint
 
-    def __init__(self, cache_size=0):
+    def __init__(self, cache_size: int = 0) -> None:
         self._cache_size = cache_size
         self._inv: Optional[weakref.ReferenceType[Transform]] = None
         if cache_size == 0:
@@ -218,16 +221,18 @@ class _InverseTransform(Transform):
     This class is private; please instead use the ``Transform.inv`` property.
     """
 
-    def __init__(self, transform: Transform):
+    def __init__(self, transform: Transform) -> None:
         super().__init__(cache_size=transform._cache_size)
         self._inv: Transform = transform  # type: ignore[assignment]
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def domain(self):
         assert self._inv is not None
         return self._inv.codomain
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         assert self._inv is not None
         return self._inv.domain
@@ -285,7 +290,7 @@ class ComposeTransform(Transform):
             the latest single value is cached. Only 0 and 1 are supported.
     """
 
-    def __init__(self, parts: list[Transform], cache_size=0):
+    def __init__(self, parts: list[Transform], cache_size: int = 0) -> None:
         if cache_size:
             parts = [part.with_cache(cache_size) for part in parts]
         super().__init__(cache_size=cache_size)
@@ -297,6 +302,7 @@ class ComposeTransform(Transform):
         return self.parts == other.parts
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def domain(self):
         if not self.parts:
             return constraints.real
@@ -312,6 +318,7 @@ class ComposeTransform(Transform):
         return domain
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         if not self.parts:
             return constraints.real
@@ -413,7 +420,12 @@ class IndependentTransform(Transform):
             dimensions to treat as dependent.
     """
 
-    def __init__(self, base_transform, reinterpreted_batch_ndims, cache_size=0):
+    def __init__(
+        self,
+        base_transform: Transform,
+        reinterpreted_batch_ndims: int,
+        cache_size: int = 0,
+    ) -> None:
         super().__init__(cache_size=cache_size)
         self.base_transform = base_transform.with_cache(cache_size)
         self.reinterpreted_batch_ndims = reinterpreted_batch_ndims
@@ -426,12 +438,14 @@ class IndependentTransform(Transform):
         )
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def domain(self):
         return constraints.independent(
             self.base_transform.domain, self.reinterpreted_batch_ndims
         )
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         return constraints.independent(
             self.base_transform.codomain, self.reinterpreted_batch_ndims
@@ -442,7 +456,7 @@ class IndependentTransform(Transform):
         return self.base_transform.bijective
 
     @property
-    def sign(self) -> int:  # type: ignore[override]
+    def sign(self) -> int:
         return self.base_transform.sign
 
     def _call(self, x):
@@ -486,7 +500,12 @@ class ReshapeTransform(Transform):
 
     bijective = True
 
-    def __init__(self, in_shape, out_shape, cache_size=0):
+    def __init__(
+        self,
+        in_shape: torch.Size,
+        out_shape: torch.Size,
+        cache_size: int = 0,
+    ) -> None:
         self.in_shape = torch.Size(in_shape)
         self.out_shape = torch.Size(out_shape)
         if self.in_shape.numel() != self.out_shape.numel():
@@ -494,10 +513,12 @@ class ReshapeTransform(Transform):
         super().__init__(cache_size=cache_size)
 
     @constraints.dependent_property
+    # pyrefly: ignore [bad-override]
     def domain(self):
         return constraints.independent(constraints.real, len(self.in_shape))
 
     @constraints.dependent_property
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         return constraints.independent(constraints.real, len(self.out_shape))
 
@@ -543,6 +564,7 @@ class ExpTransform(Transform):
     r"""
     Transform via the mapping :math:`y = \exp(x)`.
     """
+
     domain = constraints.real
     codomain = constraints.positive
     bijective = True
@@ -565,11 +587,12 @@ class PowerTransform(Transform):
     r"""
     Transform via the mapping :math:`y = x^{\text{exponent}}`.
     """
+
     domain = constraints.positive
     codomain = constraints.positive
     bijective = True
 
-    def __init__(self, exponent, cache_size=0):
+    def __init__(self, exponent: Tensor, cache_size: int = 0) -> None:
         super().__init__(cache_size=cache_size)
         (self.exponent,) = broadcast_all(exponent)
 
@@ -580,7 +603,7 @@ class PowerTransform(Transform):
 
     @lazy_property
     def sign(self) -> int:  # type: ignore[override]
-        return self.exponent.sign()
+        return self.exponent.sign()  # type: ignore[return-value]
 
     def __eq__(self, other):
         if not isinstance(other, PowerTransform):
@@ -612,6 +635,7 @@ class SigmoidTransform(Transform):
     r"""
     Transform via the mapping :math:`y = \frac{1}{1 + \exp(-x)}` and :math:`x = \text{logit}(y)`.
     """
+
     domain = constraints.real
     codomain = constraints.unit_interval
     bijective = True
@@ -637,6 +661,7 @@ class SoftplusTransform(Transform):
     Transform via the mapping :math:`\text{Softplus}(x) = \log(1 + \exp(x))`.
     The implementation reverts to the linear function when :math:`x > 20`.
     """
+
     domain = constraints.real
     codomain = constraints.positive
     bijective = True
@@ -660,15 +685,24 @@ class TanhTransform(Transform):
     Transform via the mapping :math:`y = \tanh(x)`.
 
     It is equivalent to
-    ```
-    ComposeTransform([AffineTransform(0., 2.), SigmoidTransform(), AffineTransform(-1., 2.)])
-    ```
+
+    .. code-block:: python
+
+        ComposeTransform(
+            [
+                AffineTransform(0.0, 2.0),
+                SigmoidTransform(),
+                AffineTransform(-1.0, 2.0),
+            ]
+        )
+
     However this might not be numerically stable, thus it is recommended to use `TanhTransform`
     instead.
 
     Note that one should use `cache_size=1` when it comes to `NaN/Inf` values.
 
     """
+
     domain = constraints.real
     codomain = constraints.interval(-1.0, 1.0)
     bijective = True
@@ -692,9 +726,8 @@ class TanhTransform(Transform):
 
 
 class AbsTransform(Transform):
-    r"""
-    Transform via the mapping :math:`y = |x|`.
-    """
+    r"""Transform via the mapping :math:`y = |x|`."""
+
     domain = constraints.real
     codomain = constraints.positive
 
@@ -719,9 +752,16 @@ class AffineTransform(Transform):
             for univariate random variables, 1 for distributions over vectors,
             2 for distributions over matrices, etc.
     """
+
     bijective = True
 
-    def __init__(self, loc, scale, event_dim=0, cache_size=0):
+    def __init__(
+        self,
+        loc: Union[Tensor, float],
+        scale: Union[Tensor, float],
+        event_dim: int = 0,
+        cache_size: int = 0,
+    ) -> None:
         super().__init__(cache_size=cache_size)
         self.loc = loc
         self.scale = scale
@@ -732,12 +772,14 @@ class AffineTransform(Transform):
         return self._event_dim
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def domain(self):
         if self.event_dim == 0:
             return constraints.real
         return constraints.independent(constraints.real, self.event_dim)
 
     @constraints.dependent_property(is_discrete=False)
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         if self.event_dim == 0:
             return constraints.real
@@ -758,20 +800,20 @@ class AffineTransform(Transform):
             if self.loc != other.loc:
                 return False
         else:
-            if not (self.loc == other.loc).all().item():
+            if not (self.loc == other.loc).all().item():  # type: ignore[union-attr]
                 return False
 
         if isinstance(self.scale, _Number) and isinstance(other.scale, _Number):
             if self.scale != other.scale:
                 return False
         else:
-            if not (self.scale == other.scale).all().item():
+            if not (self.scale == other.scale).all().item():  # type: ignore[union-attr]
                 return False
 
         return True
 
     @property
-    def sign(self) -> int:
+    def sign(self) -> Union[Tensor, int]:  # type: ignore[override]
         if isinstance(self.scale, _Number):
             return 1 if float(self.scale) > 0 else -1 if float(self.scale) < 0 else 0
         return self.scale.sign()
@@ -808,7 +850,7 @@ class AffineTransform(Transform):
 
 class CorrCholeskyTransform(Transform):
     r"""
-    Transforms an uncontrained real vector :math:`x` with length :math:`D*(D-1)/2` into the
+    Transforms an unconstrained real vector :math:`x` with length :math:`D*(D-1)/2` into the
     Cholesky factor of a D-dimension correlation matrix. This Cholesky factor is a lower
     triangular matrix with positive diagonals and unit Euclidean norm for each row.
     The transform is processed as follows:
@@ -822,6 +864,7 @@ class CorrCholeskyTransform(Transform):
            - Applies :math:`s_i = StickBreakingTransform(z_i)`.
            - Transforms back into signed domain: :math:`y_i = sign(r_i) * \sqrt{s_i}`.
     """
+
     domain = constraints.real_vector
     codomain = constraints.corr_cholesky
     bijective = True
@@ -834,6 +877,7 @@ class CorrCholeskyTransform(Transform):
         # apply stick-breaking on the squared values
         # Note that y = sign(r) * sqrt(z * z1m_cumprod)
         #             = (sign(r) * sqrt(z)) * sqrt(z1m_cumprod) = r * sqrt(z1m_cumprod)
+        # pyrefly: ignore [unsupported-operation]
         z = r**2
         z1m_cumprod_sqrt = (1 - z).sqrt().cumprod(-1)
         # Diagonal elements must be 1.
@@ -874,7 +918,7 @@ class CorrCholeskyTransform(Transform):
         N = shape[-1]
         D = round((0.25 + 2 * N) ** 0.5 + 0.5)
         if D * (D - 1) // 2 != N:
-            raise ValueError("Input is not a flattend lower-diagonal number")
+            raise ValueError("Input is not a flattened lower-diagonal number")
         return shape[:-1] + (D, D)
 
     def inverse_shape(self, shape):
@@ -897,6 +941,7 @@ class SoftmaxTransform(Transform):
     coordinate-wise (except for the final normalization), and thus is
     appropriate for coordinate-wise optimization algorithms.
     """
+
     domain = constraints.real_vector
     codomain = constraints.simplex
 
@@ -1007,7 +1052,7 @@ class PositiveDefiniteTransform(Transform):
     """
 
     domain = constraints.independent(constraints.real, 2)
-    codomain = constraints.positive_definite  # type: ignore[assignment]
+    codomain = constraints.positive_definite
 
     def __eq__(self, other):
         return isinstance(other, PositiveDefiniteTransform)
@@ -1038,7 +1083,13 @@ class CatTransform(Transform):
 
     transforms: list[Transform]
 
-    def __init__(self, tseq, dim=0, lengths=None, cache_size=0):
+    def __init__(
+        self,
+        tseq: Sequence[Transform],
+        dim: int = 0,
+        lengths: Optional[Sequence[int]] = None,
+        cache_size: int = 0,
+    ) -> None:
         assert all(isinstance(t, Transform) for t in tseq)
         if cache_size:
             tseq = [t.with_cache(cache_size) for t in tseq]
@@ -1115,12 +1166,14 @@ class CatTransform(Transform):
         return all(t.bijective for t in self.transforms)
 
     @constraints.dependent_property
+    # pyrefly: ignore [bad-override]
     def domain(self):
         return constraints.cat(
             [t.domain for t in self.transforms], self.dim, self.lengths
         )
 
     @constraints.dependent_property
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         return constraints.cat(
             [t.codomain for t in self.transforms], self.dim, self.lengths
@@ -1142,7 +1195,9 @@ class StackTransform(Transform):
 
     transforms: list[Transform]
 
-    def __init__(self, tseq, dim=0, cache_size=0):
+    def __init__(
+        self, tseq: Sequence[Transform], dim: int = 0, cache_size: int = 0
+    ) -> None:
         assert all(isinstance(t, Transform) for t in tseq)
         if cache_size:
             tseq = [t.with_cache(cache_size) for t in tseq]
@@ -1191,10 +1246,12 @@ class StackTransform(Transform):
         return all(t.bijective for t in self.transforms)
 
     @constraints.dependent_property
+    # pyrefly: ignore [bad-override]
     def domain(self):
         return constraints.stack([t.domain for t in self.transforms], self.dim)
 
     @constraints.dependent_property
+    # pyrefly: ignore [bad-override]
     def codomain(self):
         return constraints.stack([t.codomain for t in self.transforms], self.dim)
 
@@ -1222,12 +1279,12 @@ class CumulativeDistributionTransform(Transform):
     codomain = constraints.unit_interval
     sign = +1
 
-    def __init__(self, distribution, cache_size=0):
+    def __init__(self, distribution: Distribution, cache_size: int = 0) -> None:
         super().__init__(cache_size=cache_size)
         self.distribution = distribution
 
     @property
-    def domain(self) -> constraints.Constraint:  # type: ignore[override]
+    def domain(self) -> Optional[constraints.Constraint]:  # type: ignore[override]
         return self.distribution.support
 
     def _call(self, x):

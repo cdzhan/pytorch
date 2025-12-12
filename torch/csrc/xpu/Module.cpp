@@ -9,39 +9,17 @@
 #include <torch/csrc/utils/pycfunction_helpers.h>
 #include <torch/csrc/utils/python_numbers.h>
 #include <torch/csrc/utils/python_strings.h>
-
-#ifndef WIN32
-#include <pthread.h>
-#endif
+#include <torch/csrc/xpu/Module.h>
+#include <torch/csrc/xpu/XPUPluggableAllocator.h>
 
 using namespace torch;
 
-static bool in_bad_fork = false; // True for children forked after xpu init
-
-#ifndef WIN32
-// Called in the forked child if xpu has already been initialized
-static void forked_child() {
-  in_bad_fork = true;
-  torch::utils::set_requires_device_init(at::kXPU, true);
-}
-#endif
-
-// Should be called before the first xpu call. It is mainly called in lazy_init.
-// Note: This is distinct from initExtension because a stub xpu implementation
-// has some working functions (e.g. device_count) but cannot fully initialize.
-static void poison_fork() {
-#ifndef WIN32
-  static auto result [[maybe_unused]] =
-      pthread_atfork(nullptr, nullptr, forked_child);
-#endif
-}
-
 // XPU management methods
 
-PyObject* THXPModule_getArchFlags(PyObject* self, PyObject* noargs) {
+static PyObject* THXPModule_getArchFlags(PyObject* self, PyObject* noargs) {
   HANDLE_TH_ERRORS
 #ifdef XPU_ARCH_FLAGS
-  static const char* flags = C10_STRINGIZE(XPU_ARCH_FLAGS);
+  static const std::string flags = std::string(C10_STRINGIZE(XPU_ARCH_FLAGS));
   return THPUtils_packString(flags);
 #else
   Py_RETURN_NONE;
@@ -51,11 +29,11 @@ PyObject* THXPModule_getArchFlags(PyObject* self, PyObject* noargs) {
 
 static PyObject* THXPModule_isInBadFork_wrap(PyObject* self, PyObject* noargs) {
   HANDLE_TH_ERRORS
-  return PyBool_FromLong(in_bad_fork);
+  return PyBool_FromLong(torch::utils::is_device_in_bad_fork(at::kXPU));
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_setDevice_wrap(PyObject* self, PyObject* arg) {
+static PyObject* THXPModule_setDevice_wrap(PyObject* self, PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to set_device");
 
@@ -66,7 +44,7 @@ PyObject* THXPModule_setDevice_wrap(PyObject* self, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_exchangeDevice_wrap(PyObject* self, PyObject* arg) {
+static PyObject* THXPModule_exchangeDevice_wrap(PyObject* self, PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to exchange_device");
 
@@ -82,7 +60,9 @@ PyObject* THXPModule_exchangeDevice_wrap(PyObject* self, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_maybeExchangeDevice_wrap(PyObject* self, PyObject* arg) {
+static PyObject* THXPModule_maybeExchangeDevice_wrap(
+    PyObject* self,
+    PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(
       THPUtils_checkLong(arg), "invalid argument to maybe_exchange_device");
@@ -99,7 +79,7 @@ PyObject* THXPModule_maybeExchangeDevice_wrap(PyObject* self, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_getDevice_wrap(PyObject* self, PyObject* noargs) {
+static PyObject* THXPModule_getDevice_wrap(PyObject* self, PyObject* noargs) {
   HANDLE_TH_ERRORS
 
   auto device_index = c10::xpu::current_device();
@@ -108,14 +88,18 @@ PyObject* THXPModule_getDevice_wrap(PyObject* self, PyObject* noargs) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_getDeviceCount_wrap(PyObject* self, PyObject* noargs) {
+static PyObject* THXPModule_getDeviceCount_wrap(
+    PyObject* self,
+    PyObject* noargs) {
   HANDLE_TH_ERRORS
-  poison_fork();
+  // Note: This is distinct from initExtension because a stub xpu implementation
+  // has some working functions (e.g. device_count) but cannot fully initialize.
+  torch::utils::register_fork_handler_for_device_init(at::kXPU);
   return THPUtils_packUInt64(at::xpu::device_count());
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_getCurrentStream_wrap(
+static PyObject* THXPModule_getCurrentStream_wrap(
     PyObject* self,
     PyObject* device_index) {
   HANDLE_TH_ERRORS
@@ -136,7 +120,7 @@ PyObject* THXPModule_getCurrentStream_wrap(
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_getCurrentStream_raw(
+static PyObject* THXPModule_getCurrentStream_raw(
     PyObject* self,
     PyObject* device_index) {
   HANDLE_TH_ERRORS
@@ -149,7 +133,7 @@ PyObject* THXPModule_getCurrentStream_raw(
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_setStream_wrap(
+static PyObject* THXPModule_setStream_wrap(
     PyObject* self,
     PyObject* args,
     PyObject* kwargs) {
@@ -186,7 +170,7 @@ PyObject* THXPModule_setStream_wrap(
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_xpuSynchronize(PyObject* self, PyObject* arg) {
+static PyObject* THXPModule_xpuSynchronize(PyObject* self, PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to synchronize");
   auto device_index = THPUtils_unpackDeviceIndex(arg);
@@ -200,22 +184,22 @@ PyObject* THXPModule_xpuSynchronize(PyObject* self, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_emptyCache(PyObject* self, PyObject* noargs) {
+static PyObject* THXPModule_emptyCache(PyObject* self, PyObject* noargs) {
   HANDLE_TH_ERRORS
   c10::xpu::XPUCachingAllocator::emptyCache();
   END_HANDLE_TH_ERRORS
   Py_RETURN_NONE;
 }
 
-PyObject* THXPModule_memoryStats(PyObject* self, PyObject* arg) {
+static PyObject* THXPModule_memoryStats(PyObject* self, PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to memory_stats");
   const auto device_index = THPUtils_unpackDeviceIndex(arg);
 
+  using c10::CachingAllocator::Stat;
+  using c10::CachingAllocator::StatArray;
+  using c10::CachingAllocator::StatType;
   using c10::CachingDeviceAllocator::DeviceStats;
-  using c10::CachingDeviceAllocator::Stat;
-  using c10::CachingDeviceAllocator::StatArray;
-  using c10::CachingDeviceAllocator::StatType;
 
   const auto statToDict = [](const Stat& stat) {
     py::dict dict;
@@ -250,7 +234,9 @@ PyObject* THXPModule_memoryStats(PyObject* self, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THXPModule_resetPeakMemoryStats(PyObject* self, PyObject* arg) {
+static PyObject* THXPModule_resetPeakMemoryStats(
+    PyObject* self,
+    PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(
       THPUtils_checkLong(arg), "invalid argument to reset_peak_memory_stats");
@@ -260,7 +246,7 @@ PyObject* THXPModule_resetPeakMemoryStats(PyObject* self, PyObject* arg) {
   Py_RETURN_NONE;
 }
 
-PyObject* THXPModule_resetAccumulatedMemoryStats(
+static PyObject* THXPModule_resetAccumulatedMemoryStats(
     PyObject* self,
     PyObject* arg) {
   HANDLE_TH_ERRORS
@@ -276,7 +262,7 @@ PyObject* THXPModule_resetAccumulatedMemoryStats(
 // XPU module initialization
 
 static void registerXpuDeviceProperties(PyObject* module) {
-  // Add _xpuDevicePropertires class to torch._C
+  // Add _xpuDeviceProperties class to torch._C
   using namespace c10::xpu;
   auto get_device_type = [](const DeviceProp& prop) {
     std::ostringstream stream;
@@ -310,7 +296,22 @@ static void registerXpuDeviceProperties(PyObject* module) {
     return static_cast<int64_t>(prop.architecture);
   };
 #endif
+  // Wrapper class for XPU UUID
+  struct XPUuuid {
+    XPUuuid(const std::array<unsigned char, 16>& uuid) : bytes(uuid) {}
+    const std::array<unsigned char, 16>& bytes{};
+  };
   auto m = py::handle(module).cast<py::module>();
+
+  py::class_<XPUuuid>(m, "_XPUuuid")
+      .def_property_readonly(
+          "bytes",
+          [](const XPUuuid& uuid) {
+            return std::vector<uint8_t>(uuid.bytes.begin(), uuid.bytes.end());
+          })
+      .def("__str__", [](const XPUuuid& uuid) {
+        return uuid_to_string(reinterpret_cast<const char*>(uuid.bytes.data()));
+      });
 
 #define DEFINE_READONLY_MEMBER(member) \
   def_readonly(#member, &DeviceProp::member)
@@ -320,6 +321,7 @@ static void registerXpuDeviceProperties(PyObject* module) {
       ._(name)                                                   \
       ._(platform_name)                                          \
       ._(vendor)                                                 \
+      ._(device_id)                                              \
       ._(driver_version)                                         \
       ._(version)                                                \
       ._(max_compute_units)                                      \
@@ -342,14 +344,21 @@ static void registerXpuDeviceProperties(PyObject* module) {
       .def_property_readonly("architecture", get_device_architecture)
 #endif
       .def_property_readonly("type", get_device_type)
+      .def_property_readonly(
+          "uuid",
+          [](const DeviceProp& prop) -> XPUuuid { return XPUuuid(prop.uuid); })
       .def(
           "__repr__",
           [&get_device_type, &gpu_subslice_count](const DeviceProp& prop) {
             std::ostringstream stream;
             stream << "_XpuDeviceProperties(name='" << prop.name
                    << "', platform_name='" << prop.platform_name << "', type='"
-                   << get_device_type(prop) << "', driver_version='"
-                   << prop.driver_version << "', total_memory="
+                   << get_device_type(prop) << "', device_id=0x" << std::hex
+                   << std::uppercase << prop.device_id << std::dec << ", uuid="
+                   << uuid_to_string(
+                          reinterpret_cast<const char*>(prop.uuid.data()))
+                   << ", driver_version='" << prop.driver_version
+                   << "', total_memory="
                    << prop.global_mem_size / (1024ull * 1024) << "MB"
                    << ", max_compute_units=" << prop.max_compute_units
                    << ", gpu_eu_count=" << prop.gpu_eu_count
@@ -359,9 +368,38 @@ static void registerXpuDeviceProperties(PyObject* module) {
                    << ", sub_group_sizes=[" << prop.sub_group_sizes
                    << "], has_fp16=" << prop.has_fp16
                    << ", has_fp64=" << prop.has_fp64
-                   << ", has_atomic64=" << prop.has_atomic64 << ")";
+                   << ", has_atomic64=" << prop.has_atomic64 << ')';
             return stream.str();
           });
+}
+
+static void registerXpuPluggableAllocator(PyObject* module) {
+  auto m = py::handle(module).cast<py::module>();
+
+  py::class_<
+      c10::xpu::XPUCachingAllocator::XPUAllocator,
+      std::shared_ptr<c10::xpu::XPUCachingAllocator::XPUAllocator>>(
+      m, "_xpu_XPUAllocator");
+
+  m.def("_xpu_getAllocator", []() {
+    return py::cast(torch::xpu::XPUPluggableAllocator::getCurrentAllocator());
+  });
+  m.def(
+      "_xpu_changeCurrentAllocator",
+      [](std::shared_ptr<c10::xpu::XPUCachingAllocator::XPUAllocator>
+             allocator) {
+        torch::xpu::XPUPluggableAllocator::changeCurrentAllocator(allocator);
+      });
+  m.def("_xpu_customAllocator", [](uint64_t malloc_ptr, uint64_t free_ptr) {
+    using MallocFuncType = void*(size_t, int, sycl::queue*);
+    using FreeFuncType = void(void*, size_t, int, sycl::queue*);
+    std::function<MallocFuncType> malloc_fn =
+        reinterpret_cast<MallocFuncType*>(malloc_ptr);
+    std::function<FreeFuncType> free_fn =
+        reinterpret_cast<FreeFuncType*>(free_ptr);
+    return torch::xpu::XPUPluggableAllocator::createCustomAllocator(
+        malloc_fn, free_fn);
+  });
 }
 
 static void bindGetDeviceProperties(PyObject* module) {
@@ -378,23 +416,8 @@ static void bindGetDeviceProperties(PyObject* module) {
 static void initXpuMethodBindings(PyObject* module) {
   auto m = py::handle(module).cast<py::module>();
   m.def("_xpu_getMemoryInfo", [](c10::DeviceIndex device_index) {
-#if SYCL_COMPILER_VERSION >= 20250000
-    auto total = at::xpu::getDeviceProperties(device_index)->global_mem_size;
-    auto& device = c10::xpu::get_raw_device(device_index);
-    TORCH_CHECK(
-        device.has(sycl::aspect::ext_intel_free_memory),
-        "The device (",
-        at::xpu::getDeviceProperties(device_index)->name,
-        ") doesn't support querying the available free memory. ",
-        "You can file an issue at https://github.com/pytorch/pytorch/issues ",
-        "to help us prioritize its implementation.");
-    auto free = device.get_info<sycl::ext::intel::info::device::free_memory>();
-    return std::make_tuple(free, total);
-#else
-  TORCH_CHECK_NOT_IMPLEMENTED(
-      false,
-      "torch.xpu.mem_get_info requires PyTorch to be built with SYCL compiler version 2025.0.0 or newer.");
-#endif
+    py::gil_scoped_release no_gil;
+    return at::getDeviceAllocator(at::kXPU)->getMemoryInfo(device_index);
   });
   m.def(
       "_xpu_getStreamFromExternal",
@@ -407,14 +430,25 @@ static void initXpuMethodBindings(PyObject* module) {
         return std::make_tuple(
             stream.id(), stream.device_index(), stream.device_type());
       });
+  m.def(
+      "_xpu_canDeviceAccessPeer",
+      [](c10::DeviceIndex device, c10::DeviceIndex peer) {
+        return at::xpu::canDeviceAccessPeer(device, peer);
+      });
+  m.def("_xpu_getMemoryFraction", [](c10::DeviceIndex device) {
+    return c10::xpu::XPUCachingAllocator::getMemoryFraction(device);
+  });
+  m.def("_xpu_setMemoryFraction", [](double fraction, c10::DeviceIndex device) {
+    c10::xpu::XPUCachingAllocator::setMemoryFraction(fraction, device);
+  });
 }
 
 // Callback for python part. Used for additional initialization of python
 // classes
 static PyObject* THXPModule_initExtension(PyObject* self, PyObject* noargs) {
   HANDLE_TH_ERRORS
-  TORCH_INTERNAL_ASSERT(!in_bad_fork); // Handled at python level
-  poison_fork();
+  TORCH_INTERNAL_ASSERT(!torch::utils::is_device_in_bad_fork(at::kXPU));
+  torch::utils::register_fork_handler_for_device_init(at::kXPU);
   at::globalContext().lazyInitDevice(c10::DeviceType::XPU);
 
   auto m = THPObjectPtr(PyImport_ImportModule("torch.xpu"));
@@ -491,6 +525,7 @@ namespace torch::xpu {
 
 void initModule(PyObject* module) {
   registerXpuDeviceProperties(module);
+  registerXpuPluggableAllocator(module);
   initXpuMethodBindings(module);
 }
 

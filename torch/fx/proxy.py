@@ -8,18 +8,23 @@ import inspect
 import logging
 import operator
 import sys
+import traceback
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import fields, is_dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 import torch.fx.traceback as fx_traceback
+from torch._C import _fx_map_aggregate as map_aggregate, _fx_map_arg as map_arg
+from torch._library.opaque_object import is_opaque_value_type
+from torch._logging import getArtifactLogger
 from torch.utils._traceback import CapturedTraceback
 
 from ._compatibility import compatibility
 from .graph import Graph, magic_methods, reflectable_magic_methods
-from .node import Argument, base_types, map_aggregate, Node, Target
+from .immutable_collections import immutable_dict, immutable_list
+from .node import Argument, base_types, Node, Target
 from .operator_schemas import check_for_mutable_operation
 
 
@@ -37,6 +42,7 @@ __all__ = [
 
 
 log = logging.getLogger(__name__)
+annotation_log = getArtifactLogger(__name__, "annotation")
 
 
 @compatibility(is_backward_compatible=False)
@@ -121,6 +127,10 @@ _COPY_META_FIELDS = [
 class TracerBase:
     graph: Graph
     record_stack_traces: bool = False
+    # When record_stack_traces is True, only reocrd stack traces
+    # with forward function names.
+    # This helps when we want stack trace back to model code
+    _record_forward_stack_traces_only: bool = False
     # Feature flag for mutable schema checking
     # Enableby default in 1.12
     check_mutable_operations: bool = False
@@ -178,6 +188,10 @@ class TracerBase:
             stack_trace = current_meta.get("stack_trace")
             if stack_trace:
                 node.stack_trace = stack_trace
+
+                if fx_traceback.GRADIENT_ACC_SPECIAL_STACK in stack_trace:
+                    node.meta["is_gradient_acc"] = True
+
             # Explicitly set the stack_trace, nn_module_stack and source_fn on the node.meta
             # If other meta fields are needed, they can be added here
             for field in _COPY_META_FIELDS:
@@ -195,14 +209,76 @@ class TracerBase:
             # BWD pass we retrieve the sequence_nr stored on the current
             # executing autograd Node. See NOTE [ Sequence Number ].
             if current_meta.get("in_grad_fn", 0) > 0:
+                annotation_log.debug("seq_nr from current_meta")
                 new_seq_nr = current_meta["grad_fn_seq_nr"][-1]
+
+            # See Note [Functionalization View Replay Annotation]
+            # Overriding some node meta with the original node meta of the
+            # regenerated node.
+            replay_node: Node = fx_traceback.get_current_replay_node()
+            if replay_node is not None:
+                node.meta["is_functional_regenerated"] = True
+                if "seq_nr" in replay_node.meta:
+                    annotation_log.debug("seq_nr from replay_node")
+                    new_seq_nr = replay_node.meta["seq_nr"]
+                if "custom" in replay_node.meta:
+                    node.meta["custom"] = replay_node.meta.get("custom")
+                if "stack_trace" in replay_node.meta:
+                    node.stack_trace = replay_node.meta.get("stack_trace")
+
+            annotation_log.debug("Assigning new_seq_nr %s to %s", new_seq_nr, node.name)
             node.meta["seq_nr"] = new_seq_nr
 
         elif self.module_stack:
             node.meta["nn_module_stack"] = copy.copy(self.module_stack)
 
+        if self.record_stack_traces and not node.stack_trace:
+            user_stack_summary = CapturedTraceback.extract().summary()
+            if user_stack_summary:
+                user_stack_summary = self._filter_traceback_frames(user_stack_summary)
+                if user_stack_summary:
+                    node.stack_trace = "".join(user_stack_summary.format()).strip()
+
         log.debug("create_node %s", node)
         return node
+
+    def _filter_traceback_frames(
+        self, user_stack_summary: traceback.StackSummary
+    ) -> traceback.StackSummary:
+        # This method can be overridden to customize the frame filtering logic
+        # for the recorded stack trace
+        user_frames = []
+        if self._record_forward_stack_traces_only:
+            user_frames = [
+                frame
+                for frame in user_stack_summary
+                if (
+                    frame.name == "forward"
+                    or frame.filename.endswith("torch/__init__.py")
+                )
+            ]
+        else:
+            first_forward = -1
+            for i, frame in enumerate(user_stack_summary):
+                if frame.name == "forward":
+                    user_frames = user_stack_summary[i:]
+                    first_forward = i
+                    break
+
+            # Not having a "forward" call in the stacktrace implies the
+            # stacktrace will probably be irrelevant
+            if first_forward == -1:
+                user_frames = []
+
+        from torch.fx.experimental.symbolic_shapes import uninteresting_files
+
+        user_frames = [
+            frame
+            for frame in user_frames
+            if frame.filename not in uninteresting_files()
+        ]
+
+        return traceback.StackSummary.from_list(user_frames)
 
     @compatibility(is_backward_compatible=True)
     def proxy(self, node: Node) -> "Proxy":
@@ -241,9 +317,6 @@ class TracerBase:
             proxy = self.proxy(node)
         else:
             proxy = proxy_factory_fn(node)
-
-        if self.record_stack_traces and not proxy.node.stack_trace:
-            proxy.node.stack_trace = "".join(CapturedTraceback.extract().format())
 
         return proxy
 
@@ -289,6 +362,24 @@ class TracerBase:
 
         Can be override to support more trace-specific types.
         """
+        # IMPORTANT: Are you here because you are trying to proxy a new type into
+        # the graph? Please Please Please contact someone on the PyTorch Compiler team;
+        # the considerations are subtle.
+        #
+        # 1) When you add a new type, all of the downstream consumers and pass writers
+        # need to handle the new type. torch.fx is intended to be easy to write
+        # passes for, so we will push back against new types.
+        # 2) In torch.compile's IR, there are only specific operations that go
+        # into the graph. In particular, Tensor operations should go into the graph,
+        # but non-Tensor operations shouldn't. What that means is that constructors
+        # for new types *SHOULD NOT* become nodes in the FX graph.
+        handler = _create_arg_bypass.get(type(a))
+        if handler is not None:
+            # this is just a performance optimization and can be removed if needed
+            # for common types, we have a fast path to avoid isinstance() overhead
+            # this doesn't remove the checks below since we need to handle subclasses
+            return handler(self, a)
+
         if isinstance(a, Proxy):
             return a.node  # most common arg type goes first
         elif hasattr(a, "__fx_create_arg__"):
@@ -305,24 +396,7 @@ class TracerBase:
         elif isinstance(a, list):
             return [self.create_arg(elem) for elem in a]
         elif isinstance(a, dict):
-
-            def no_node(arg):
-                if isinstance(arg, Node):
-                    raise RuntimeError(
-                        "Keys for dictionaries used as an argument cannot contain a "
-                        f"Node. Got key: {k}"
-                    )
-
-            r = {}
-            for k, v in a.items():
-                # Check for invalid dict keys. We do not want a Proxy to appear
-                # anywhere within the key. Since keys can be collection types,
-                # we iterate through the key with map_aggregate
-                k = self.create_arg(k)
-                map_aggregate(k, no_node)
-
-                r[k] = self.create_arg(v)
-            return r
+            return _create_arg_dict(self, a)
         elif isinstance(a, slice):
             return slice(
                 self.create_arg(a.start),
@@ -338,6 +412,9 @@ class TracerBase:
             )
 
         elif isinstance(a, (torch._ops.OpOverload, torch._ops.HigherOrderOperator)):
+            return a
+
+        elif is_opaque_value_type(type(a)):
             return a
 
         elif is_dataclass(a):
@@ -572,8 +649,8 @@ class Proxy:
             if isinstance(a, cls):
                 tracers[a.tracer] = None
 
-        torch.fx.node.map_aggregate(args, find_tracer)
-        torch.fx.node.map_aggregate(kwargs, find_tracer)
+        map_aggregate(args, find_tracer)
+        map_aggregate(kwargs, find_tracer)
 
         if len(tracers) > 1:
             raise RuntimeError(
@@ -628,9 +705,9 @@ class MetaProxy(Proxy):
                 meta_proxy = arg
                 break
 
-        assert (
-            meta_proxy is not None
-        ), "No MetaProxy found in arguments, but one is expected."
+        assert meta_proxy is not None, (
+            "No MetaProxy found in arguments, but one is expected."
+        )
 
         proxy = super().__torch_function__(orig_method, types, args, kwargs)
         with meta_proxy.fake_mode:
@@ -713,14 +790,14 @@ for method in magic_methods:
             return tracer.create_proxy("call_function", target, args, kwargs)
 
         impl.__name__ = method
-        as_magic = f'__{method.strip("_")}__'
+        as_magic = f"__{method.strip('_')}__"
         setattr(Proxy, as_magic, impl)
 
     _scope(method)
 
 
 def _define_reflectable(orig_method_name):
-    method_name = f'__r{orig_method_name.strip("_")}__'
+    method_name = f"__r{orig_method_name.strip('_')}__"
 
     def impl(self, rhs):
         target = getattr(operator, orig_method_name)
@@ -733,3 +810,41 @@ def _define_reflectable(orig_method_name):
 
 for orig_method_name in reflectable_magic_methods:
     _define_reflectable(orig_method_name)
+
+
+def _no_nodes_error(arg):
+    raise RuntimeError(
+        "Keys for dictionaries used as an argument cannot contain a "
+        f"Node. Got key: {arg}"
+    )
+
+
+def _create_arg_dict(self, a):
+    r = {}
+    for k, v in a.items():
+        if not isinstance(k, str):
+            # Check for invalid dict keys. We do not want a Proxy to appear
+            # anywhere within the key. Since keys can be collection types,
+            # we iterate through the key with map_arg
+            k = self.create_arg(k)
+            map_arg(k, _no_nodes_error)
+        r[k] = self.create_arg(v)
+    return r
+
+
+_create_arg_bypass = {
+    t: lambda self, a: a
+    for t in [
+        *base_types,
+        type(None),
+        type(...),
+        torch._ops.OpOverload,
+        torch._ops.HigherOrderOperator,
+    ]
+}
+_create_arg_bypass[Proxy] = lambda self, a: a.node
+_create_arg_bypass[tuple] = lambda self, a: tuple(self.create_arg(elem) for elem in a)
+_create_arg_bypass[list] = lambda self, a: [self.create_arg(elem) for elem in a]
+_create_arg_bypass[dict] = _create_arg_dict
+_create_arg_bypass[immutable_list] = _create_arg_bypass[list]
+_create_arg_bypass[immutable_dict] = _create_arg_bypass[dict]

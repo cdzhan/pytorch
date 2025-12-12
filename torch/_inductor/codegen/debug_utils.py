@@ -5,7 +5,7 @@ import functools
 import logging
 import os
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import torch
 from torch import dtype as torch_dtype
@@ -13,6 +13,10 @@ from torch import dtype as torch_dtype
 from .. import config
 from ..virtualized import V
 from .multi_kernel import MultiKernel
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 log = logging.getLogger(__name__)
@@ -23,6 +27,9 @@ def _print_debugging_tensor_value_info(msg, arg):
     # at jit inductor level codegen
     max_numel_to_print = 64
     print(msg)
+    if not isinstance(arg, torch.Tensor):
+        print("Value: ", arg)
+        return
     numel = arg.float().numel()
     # print the debug printing stats
     if numel <= max_numel_to_print:
@@ -54,6 +61,7 @@ class DebugPrinterManager:
         self,
         debug_printer_level,
         use_array_ref: bool,
+        writeline: Optional[Callable[..., None]] = None,
         args_to_print_or_save: Optional[list[str]] = None,
         kernel_name: str = "",
         kernel=None,
@@ -153,7 +161,9 @@ class DebugPrinterManager:
         # TODO: Find a more reliable way to detect kernel args types to print for extern kernel calls
         if kernel_type == "extern":
             args_to_print_or_save_extern = [
-                arg for arg in args_to_print_or_save if arg.startswith(("buf", "arg"))
+                arg
+                for arg in args_to_print_or_save
+                if isinstance(arg, str) and arg.startswith(("buf", "arg"))
             ]
             self.args_to_print_or_save = args_to_print_or_save_extern
         elif kernel_type == "cpp":
@@ -164,7 +174,7 @@ class DebugPrinterManager:
                     else arg
                 )
                 for arg in args_to_print_or_save
-                if arg.startswith(("buf", "arg"))
+                if isinstance(arg, str) and arg.startswith(("buf", "arg"))
             ]
         else:
             self.args_to_print_or_save = args_to_print_or_save
@@ -251,7 +261,7 @@ class DebugPrinterManager:
                 continue
             if V.graph.cpp_wrapper:
                 if arg_signatures is not None and isinstance(
-                    arg_signatures[i], (torch_dtype)
+                    arg_signatures[i], torch_dtype
                 ):
                     # infer from the arg data type (has torch.dtype) to see if it is a tensor type
                     V.graph.wrapper_code.writeline(
@@ -270,7 +280,7 @@ class DebugPrinterManager:
                         f'printf("[  {launch_prefix} - {kernel_name} - {arg}: %ld  ]", {arg}); printf("\\\\n");'
                     )
                 else:
-                    if arg_signatures is None and self.kernel_type == "cpp" or "extern":
+                    if arg_signatures is None and self.kernel_type in ("cpp", "extern"):
                         V.graph.wrapper_code.writeline(
                             f'aoti_torch_print_tensor_handle({arg}, "{launch_prefix} - {kernel_name} - {arg}");'
                         )

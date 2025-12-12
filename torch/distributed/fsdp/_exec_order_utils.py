@@ -190,9 +190,9 @@ class _ExecOrderData:
             return
         if self.is_first_iter:
             msg_prefix = "Forward order differs across ranks:"
-            optional_local_indices: tuple[
-                Optional[int], ...
-            ] = self._get_handle_indices(handle)
+            optional_local_indices: tuple[Optional[int], ...] = (
+                self._get_handle_indices(handle)
+            )
             device = handle.device  # guaranteed to be non-CPU
             num_valid_indices = sum(
                 (index is not None) for index in optional_local_indices
@@ -214,7 +214,8 @@ class _ExecOrderData:
             # parameters
             # TODO (awgu): Since every module has at most one handle in the
             # current implementation, this should never raise the error.
-            assert self.world_size is not None  # mypy
+            if self.world_size is None:
+                raise AssertionError("Expected world_size to not be None")
             if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
                 # TODO(voz): Don't graph break on this - dynamo hates the n1 != n2
                 # tensor comparison control flow.
@@ -250,8 +251,7 @@ class _ExecOrderData:
                         (
                             rank,
                             world_indices[
-                                rank
-                                * num_valid_indices : (rank + 1)
+                                rank * num_valid_indices : (rank + 1)
                                 * num_valid_indices
                             ],
                         )
@@ -299,7 +299,8 @@ class _ExecOrderData:
                 warnings.warn(
                     "Forward order differs from that of the first iteration "
                     f"on rank {self.rank}. Collectives are unchecked and may "
-                    f"give incorrect results or hang.\n{msg_prefix}{msg_suffix}"
+                    f"give incorrect results or hang.\n{msg_prefix}{msg_suffix}",
+                    stacklevel=2,
                 )
                 self.warn_status = _ExecOrderWarnStatus.WARNING
             self.current_order_index += 1

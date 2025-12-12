@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, TYPE_CHECKING
 from warnings import warn
 
 from tools.testing.target_determination.heuristics.interface import (
@@ -15,6 +15,10 @@ from tools.testing.target_determination.heuristics.utils import (
     query_changed_files,
 )
 from tools.testing.test_run import TestRun
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 REPO_ROOT = Path(__file__).parents[3]
@@ -67,8 +71,7 @@ def get_keywords(file: str) -> list[str]:
 
 
 def sanitize_name(folder_name: str) -> str:
-    if folder_name.startswith("_"):
-        folder_name = folder_name[1:]
+    folder_name = folder_name.removeprefix("_")
 
     for syn_rep, syns in keyword_synonyms.items():
         if folder_name in syns or folder_name == syn_rep:

@@ -12,7 +12,6 @@
 #include <c10/util/Exception.h>
 #include <c10/util/StringUtil.h>
 #include <c10/util/irange.h>
-#include <torch/csrc/Export.h>
 #include <torch/csrc/jit/frontend/source_range.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/testing/file_check.h>
@@ -100,8 +99,8 @@ size_t assertFind(
     std::stringstream ss;
     ss << "Expected to find ";
     c10::printQuotedString(ss, sub);
-    ss << " but did not find it" << std::endl;
-    ss << "Searched string:" << std::endl;
+    ss << " but did not find it" << '\n';
+    ss << "Searched string:" << '\n';
     found_range.highlight(ss);
     if (extra_msg) {
       extra_msg(ss);
@@ -116,7 +115,7 @@ size_t assertFind(
     const std::string& sub,
     const Check& check) {
   return assertFind(search_range, sub, [&](std::ostream& out) {
-    out << "From " << check << "\n";
+    out << "From " << check << '\n';
   });
 }
 
@@ -139,8 +138,8 @@ size_t assertFindRegex(
     std::stringstream ss;
     ss << "Expected to find regex ";
     c10::printQuotedString(ss, sub);
-    ss << " but did not find it" << std::endl;
-    ss << "Searched string:" << std::endl;
+    ss << " but did not find it" << '\n';
+    ss << "Searched string:" << '\n';
     if (extra_msg) {
       extra_msg(ss);
     }
@@ -156,7 +155,7 @@ size_t assertFindRegex(
     const std::string& sub,
     const Check& check) {
   return assertFindRegex(search_range, sub, [&](std::ostream& out) {
-    out << "From " << check << "\n";
+    out << "From " << check << '\n';
   });
 }
 
@@ -182,7 +181,7 @@ void assertNotFind(
     c10::printQuotedString(ss, sub);
     ss << " but found it\n";
     found_range.highlight(ss);
-    ss << "From " << check << "\n";
+    ss << "From " << check << '\n';
     throw std::runtime_error(ss.str());
   }
 }
@@ -363,7 +362,7 @@ struct FileCheckImpl {
       std::stringstream ss;
       ss << "Expected to find ";
       c10::printQuotedString(ss, check.search_str_);
-      ss << "highlighted but it is not." << std::endl;
+      ss << "highlighted but it is not." << '\n';
       error_range.highlight(ss);
       throw std::runtime_error(ss.str());
     };
@@ -543,7 +542,7 @@ FileCheck::FileCheck() : fcImpl(new FileCheckImpl()) {}
 std::ostream& operator<<(std::ostream& out, const FileCheckImpl& fc) {
   out << "FileCheck checks:\n";
   for (const Check& c : fc.checks) {
-    out << "\t" << c << "\n";
+    out << '\t' << c << '\n';
   }
   return out;
 }

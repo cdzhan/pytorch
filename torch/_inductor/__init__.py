@@ -4,15 +4,18 @@ from __future__ import annotations
 import io
 import logging
 import os
-from typing import Any, Dict, IO, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, IO, Literal, Optional, TYPE_CHECKING, Union
 
-import torch._inductor.config
 import torch.fx
+
+from .standalone_compile import CompiledArtifact  # noqa: TC001
 
 
 if TYPE_CHECKING:
     from torch._inductor.utils import InputType
     from torch.export import ExportedProgram
+    from torch.export.pt2_archive._package import AOTICompiledModel
+    from torch.export.pt2_archive._package_weights import Weights
     from torch.types import FileLike
 
 __all__ = [
@@ -20,6 +23,7 @@ __all__ = [
     "list_mode_options",
     "list_options",
     "cudagraph_mark_step_begin",
+    "standalone_compile",
 ]
 
 
@@ -59,22 +63,38 @@ def aoti_compile_and_package(
     """
     Compiles the exported program with AOTInductor, and packages it into a .pt2
     artifact specified by the input package_path. To load the package, you can
-    call `torch._inductor.aoti_load_package(package_path)`.
+    call ``torch._inductor.aoti_load_package(package_path)``.
 
-    To compile and save multiple models into a single .pt2 artifact, you can do
+    An example usage is as follows:
+
+    .. code-block:: python
+
+        ep = torch.export.export(M(), ...)
+        aoti_file = torch._inductor.aoti_compile_and_package(
+            ep, package_path="my_package.pt2"
+        )
+        compiled_model = torch._inductor.aoti_load_package("my_package.pt2")
+
+    To compile and save multiple models into a single ``.pt2`` artifact, you can do
     the following:
-    ```
-    ep1 = torch.export.export(M1(), ...)
-    aoti_file1 = torch._inductor.aot_compile(ep1, ...)
-    ep2 = torch.export.export(M2(), ...)
-    aoti_file2 = torch._inductor.aot_compile(ep2, ...)
 
-    from torch._inductor.package import package_aoti, load_package
-    package_aoti("my_package.pt2", {"model1": aoti_file1, "model2": aoti_file2})
+    .. code-block:: python
 
-    compiled_model1 = load_package("my_package.pt2", "model1")
-    compiled_model2 = load_package("my_package.pt2", "model2")
-    ```
+        ep1 = torch.export.export(M1(), ...)
+        aoti_file1 = torch._inductor.aot_compile(
+            ep1, ..., options={"aot_inductor.package": True}
+        )
+        ep2 = torch.export.export(M2(), ...)
+        aoti_file2 = torch._inductor.aot_compile(
+            ep2, ..., options={"aot_inductor.package": True}
+        )
+
+        from torch._inductor.package import package_aoti, load_package
+
+        package_aoti("my_package.pt2", {"model1": aoti_file1, "model2": aoti_file2})
+
+        compiled_model1 = load_package("my_package.pt2", "model1")
+        compiled_model2 = load_package("my_package.pt2", "model2")
 
     Args:
         exported_program: An exported program created through a call from torch.export
@@ -114,7 +134,9 @@ def aoti_compile_and_package(
             isinstance(package_path, (str, os.PathLike))
             and os.fspath(package_path).endswith(".pt2")
         )
-    ), f"Expect package path to be a file ending in .pt2, is None, or is a buffer. Instead got {package_path}"
+    ), (
+        f"Expect package path to be a file ending in .pt2, is None, or is a buffer. Instead got {package_path}"
+    )
 
     inductor_configs = inductor_configs or {}
     inductor_configs["aot_inductor.package"] = True
@@ -129,6 +151,7 @@ def aoti_compile_and_package(
     return aot_inductor_minifier_wrapper(
         _aoti_compile_and_package_inner,
         exported_program,
+        # pyrefly: ignore [bad-argument-type]
         package_path=package_path,
         inductor_configs=inductor_configs,
     )
@@ -159,9 +182,9 @@ def _aoti_compile_and_package_inner(
     """
 
     if check_accuracy:
-        assert (
-            kwargs is None or len(kwargs) == 0
-        ), "when checking for accuracy, the inputs must have been flattened and kwargs is None"
+        assert kwargs is None or len(kwargs) == 0, (
+            "when checking for accuracy, the inputs must have been flattened and kwargs is None"
+        )
 
     from .package import package_aoti
 
@@ -176,13 +199,13 @@ def _aoti_compile_and_package_inner(
         path = [
             os.path.splitext(file)[0]
             for file in aoti_files
-            if os.path.splitext(file)[1] == ".so"
+            if isinstance(file, str) and os.path.splitext(file)[1] == ".so"
         ]
         if len(path) == 0:
             path = [
                 os.path.splitext(file)[0]
                 for file in aoti_files
-                if os.path.splitext(file)[1] == ".cpp"
+                if isinstance(file, str) and os.path.splitext(file)[1] == ".cpp"
             ]
         package_path = path[0] + ".pt2"
 
@@ -201,7 +224,7 @@ def _aoti_compile_and_package_inner(
             not_strict_accuracy = check_accuracy == "accuracy"
             if not same_two_models(
                 gm,
-                compiled_model,
+                compiled_model,  # type: ignore[arg-type]
                 args,
                 only_fwd=True,
                 require_fp64=not_strict_accuracy,
@@ -214,34 +237,46 @@ def _aoti_compile_and_package_inner(
     return package_path
 
 
-def aoti_load_package(path: FileLike) -> Any:  # type: ignore[type-arg]
+def aoti_load_package(
+    path: FileLike, run_single_threaded: bool = False, device_index: int = -1
+) -> AOTICompiledModel:
     """
     Loads the model from the PT2 package.
 
     If multiple models were packaged into the PT2, this will load the default
     model. To load a specific model, you can directly call the load API
-    ```
-    from torch._inductor.package import load_package
 
-    compiled_model1 = load_package("my_package.pt2", "model1")
-    compiled_model2 = load_package("my_package.pt2", "model2")
-    ```
+    .. code-block:: python
+
+        from torch._inductor.package import load_package
+
+        compiled_model1 = load_package("my_package.pt2", "model1")
+        compiled_model2 = load_package("my_package.pt2", "model2")
 
     Args:
         path: Path to the .pt2 package
+        run_single_threaded (bool): Whether the model should be run without
+            thread synchronization logic. This is useful to avoid conflicts with
+            CUDAGraphs.
+        device_index (int): The index of the device to which the PT2 package is
+            to be loaded. By default, `device_index=-1` is used, which corresponds
+            to the device `cuda` when using CUDA. Passing `device_index=1` would
+            load the package to `cuda:1`, for example.
     """
     from torch._inductor.package import load_package
 
-    return load_package(path)
+    return load_package(
+        path, run_single_threaded=run_single_threaded, device_index=device_index
+    )
 
 
 def aot_compile(
     gm: torch.fx.GraphModule,
-    args: tuple[Any],
+    args: tuple[Any, ...],
     kwargs: Optional[dict[str, Any]] = None,
     *,
     options: Optional[dict[str, Any]] = None,
-) -> Union[str, list[str]]:
+) -> Union[str, list[Union[str, Weights]], torch.fx.GraphModule]:
     """
     Ahead-of-time compile a given FX graph with TorchInductor into a shared library.
 
@@ -258,15 +293,45 @@ def aot_compile(
     """
     from .compile_fx import _aoti_flatten_inputs, compile_fx_aot
 
+    if hasattr(gm, "_guards_fn"):
+        # Do not compile the guards function, since it may contain checks
+        # that are not currently supported by AOTI. In particular, non-Tensor
+        # arguments are converted to None and will fail specialization checks.
+        node = next(iter(gm.graph.find_nodes(op="call_module", target="_guards_fn")))
+        gm.graph.erase_node(node)
+        delattr(gm, "_guards_fn")
+        gm.recompile()
+
     flat_example_inputs, options = _aoti_flatten_inputs(
         gm, args, kwargs, options=options
     )
+    from torch._export.utils import _compiling_state_context
 
-    return compile_fx_aot(
-        gm,
-        flat_example_inputs,  # type: ignore[arg-type]
-        config_patches=options,
-    )
+    with _compiling_state_context():
+        return compile_fx_aot(
+            gm,
+            flat_example_inputs,  # type: ignore[arg-type]
+            config_patches=options,
+        )
+
+
+lite_mode_options = {
+    # Fallback by default unless users explicitly annotated with
+    # regional inductor compile.
+    "fallback_by_default": True,
+    "selective_decompose": True,
+    # Disable reorder optimizations
+    "reorder_for_peak_memory": False,
+    "reorder_for_compute_comm_overlap": False,
+    "triton.reorder_for_reducing_graph_partitions": False,
+    # Disable pre-, joint-, post-grad passes
+    "use_pre_grad_passes": False,
+    "use_joint_graph_passes": False,
+    "use_post_grad_passes": False,
+    # Disable dead code elimination (dce) and buffer reuse
+    "use_dce": False,
+    "allow_buffer_reuse": False,
+}
 
 
 def list_mode_options(
@@ -286,6 +351,8 @@ def list_mode_options(
 
     mode_options: dict[str, dict[str, bool]] = {
         "default": {},
+        # lite backend for opt-in optimizations
+        "lite": lite_mode_options,
         # enable cudagraphs
         "reduce-overhead": {
             "triton.cudagraphs": True,
@@ -334,3 +401,47 @@ def cudagraph_mark_step_begin():
     from .cudagraph_trees import mark_step_begin
 
     mark_step_begin()
+
+
+def standalone_compile(
+    gm: torch.fx.GraphModule,
+    example_inputs: list[InputType],
+    *,
+    dynamic_shapes: Literal[
+        "from_example_inputs", "from_tracing_context", "from_graph"
+    ] = "from_graph",
+    options: Optional[dict[str, Any]] = None,
+    aot: bool = False,  # AOT mode, which uses BundledAOTAutogradCache
+) -> CompiledArtifact:
+    """
+    Precompilation API for inductor.
+
+    .. code-block:: python
+
+        compiled_artifact = torch._inductor.standalone_compile(gm, args)
+        compiled_artifact.save(path=path, format="binary")
+
+        # Later on a new process
+        loaded = torch._inductor.CompiledArtifact.load(path=path, format="binary")
+        compiled_out = loaded(*args)
+
+    Args:
+        gm: Graph Module
+        example_inputs: Inputs for the graph module
+        dynamic_shapes: If "from_graph" (default), we will use the dynamic
+            shapes in the passed-in graph module.
+            If "from_tracing_context", we use the dynamic shape info in the
+            ambient tracing context.
+            If "from_example_inputs", we will specialize the graph on the
+            example_inputs.
+        options: Inductor compilation options
+
+    Returns:
+        CompiledArtifact that can be saved to disk or invoked directly.
+    """
+    from .standalone_compile import standalone_compile
+
+    options = options if options else {}
+    return standalone_compile(
+        gm, example_inputs, dynamic_shapes=dynamic_shapes, options=options, aot=aot
+    )

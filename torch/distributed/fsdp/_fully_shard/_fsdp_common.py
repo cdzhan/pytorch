@@ -15,32 +15,25 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 
 _compiled_autograd_enabled: bool = False
 
-if torch._running_with_deploy():
 
-    def detect_compiled_autograd():
-        pass
-
-    def compiled_autograd_enabled():
-        return False
-
-else:
-
-    def detect_compiled_autograd():
-        assert (
-            not torch.compiler.is_compiling()
-        ), "`detect_compiled_autograd()` is designed to be called in eager mode"
-        global _compiled_autograd_enabled
-        import torch._dynamo.compiled_autograd as ca
-
-        _compiled_autograd_enabled = (
-            ca.compiled_autograd_enabled
-            or ca.compiled_autograd_enabled_force_eager
-            or ca.in_compiled_autograd_region
+def detect_compiled_autograd():
+    if torch.compiler.is_compiling():
+        raise AssertionError(
+            "`detect_compiled_autograd()` is designed to be called in eager mode"
         )
+    global _compiled_autograd_enabled
+    import torch._dynamo.compiled_autograd as ca
 
-    def compiled_autograd_enabled():
-        global _compiled_autograd_enabled
-        return _compiled_autograd_enabled
+    _compiled_autograd_enabled = (
+        ca.compiled_autograd_enabled
+        or ca.compiled_autograd_enabled_force_eager
+        or ca.in_compiled_autograd_region
+    )
+
+
+def compiled_autograd_enabled():
+    global _compiled_autograd_enabled
+    return _compiled_autograd_enabled
 
 
 @dataclass
@@ -80,7 +73,7 @@ class DDPMeshInfo(DataParallelMeshInfo):
 
 @dataclass
 class HSDPMeshInfo(FSDPMeshInfo, DDPMeshInfo):
-    def __post_init__(self):
+    def __post_init__(self):  # pylint:disable=useless-parent-delegation
         # Calls `FSDPMeshInfo` -> `DDPMeshInfo` -> `DataParallelMeshInfo`
         super().__post_init__()
 
@@ -146,11 +139,14 @@ def _from_local_no_grad(
     """
 
     if not compiled_autograd_enabled():
+        # pyrefly: ignore [bad-argument-type]
         return DTensor(
             # Use the local tensor directly instead of constructing a new tensor
             # variable, e.g. with `view_as()`, since this is not differentiable
+            # pyrefly: ignore [bad-argument-count]
             local_tensor,
             sharding_spec,
+            # pyrefly: ignore [unexpected-keyword]
             requires_grad=local_tensor.requires_grad,
         )
     else:
@@ -179,3 +175,7 @@ def _cast_fp_tensor(dtype: torch.dtype, x: torch.Tensor) -> torch.Tensor:
     ):
         return x
     return x.to(dtype)
+
+
+def is_bw() -> bool:
+    return torch._C._current_graph_task_id() != -1

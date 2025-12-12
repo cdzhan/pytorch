@@ -39,7 +39,7 @@ class Wishart(ExponentialFamily):
         >>> # xdoctest: +SKIP("FIXME: scale_tril must be at least two-dimensional")
         >>> m = Wishart(torch.Tensor([2]), covariance_matrix=torch.eye(2))
         >>> m.sample()  # Wishart distributed with mean=`df * I` and
-        >>>             # variance(x_ij)=`df` for i != j and variance(x_ij)=`2 * df` for i == j
+        >>> # variance(x_ij)=`df` for i != j and variance(x_ij)=`2 * df` for i == j
 
     Args:
         df (float or Tensor): real-valued parameter larger than the (dimension of Square matrix) - 1
@@ -63,15 +63,19 @@ class Wishart(ExponentialFamily):
     [4] Odell, P. L. & Feiveson, A. H., 1966. `A Numerical Procedure to Generate a SampleCovariance Matrix`. JASA, 61(313):199-203.
     [5] Ku, Y.-C. & Bloomfield, P., 2010. `Generating Random Wishart Matrices with Fractional Degrees of Freedom in OX`.
     """
-    arg_constraints = {
-        "covariance_matrix": constraints.positive_definite,
-        "precision_matrix": constraints.positive_definite,
-        "scale_tril": constraints.lower_cholesky,
-        "df": constraints.greater_than(0),
-    }
+
     support = constraints.positive_definite
     has_rsample = True
     _mean_carrier_measure = 0
+
+    @property
+    def arg_constraints(self):
+        return {
+            "covariance_matrix": constraints.positive_definite,
+            "precision_matrix": constraints.positive_definite,
+            "scale_tril": constraints.lower_cholesky,
+            "df": constraints.greater_than(self.event_shape[-1] - 1),
+        }
 
     def __init__(
         self,
@@ -79,11 +83,13 @@ class Wishart(ExponentialFamily):
         covariance_matrix: Optional[Tensor] = None,
         precision_matrix: Optional[Tensor] = None,
         scale_tril: Optional[Tensor] = None,
-        validate_args=None,
-    ):
+        validate_args: Optional[bool] = None,
+    ) -> None:
         assert (covariance_matrix is not None) + (scale_tril is not None) + (
             precision_matrix is not None
-        ) == 1, "Exactly one of covariance_matrix or precision_matrix or scale_tril may be specified."
+        ) == 1, (
+            "Exactly one of covariance_matrix or precision_matrix or scale_tril may be specified."
+        )
 
         param = next(
             p
@@ -110,16 +116,19 @@ class Wishart(ExponentialFamily):
             )
 
         if scale_tril is not None:
+            # pyrefly: ignore [read-only]
             self.scale_tril = param.expand(batch_shape + (-1, -1))
         elif covariance_matrix is not None:
+            # pyrefly: ignore [read-only]
             self.covariance_matrix = param.expand(batch_shape + (-1, -1))
         elif precision_matrix is not None:
+            # pyrefly: ignore [read-only]
             self.precision_matrix = param.expand(batch_shape + (-1, -1))
 
-        self.arg_constraints["df"] = constraints.greater_than(event_shape[-1] - 1)
         if self.df.lt(event_shape[-1]).any():
             warnings.warn(
-                "Low df values detected. Singular samples are highly likely to occur for ndim - 1 < df < ndim."
+                "Low df values detected. Singular samples are highly likely to occur for ndim - 1 < df < ndim.",
+                stacklevel=2,
             )
 
         super().__init__(batch_shape, event_shape, validate_args=validate_args)
@@ -271,7 +280,7 @@ class Wishart(ExponentialFamily):
         else:
             # More optimized version with data-dependent control flow.
             if is_singular.any():
-                warnings.warn("Singular sample detected.")
+                warnings.warn("Singular sample detected.", stacklevel=2)
 
                 for _ in range(max_try_correction):
                     sample_new = self._bartlett_sampling(is_singular[is_singular].shape)
@@ -330,6 +339,7 @@ class Wishart(ExponentialFamily):
         p = self._event_shape[-1]  # has singleton shape
         return -self.precision_matrix / 2, (nu - p - 1) / 2
 
+    # pyrefly: ignore [bad-override]
     def _log_normalizer(self, x, y):
         p = self._event_shape[-1]
         return (y + (p + 1) / 2) * (

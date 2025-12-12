@@ -6,7 +6,6 @@
 #include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/constant_pooling.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/freeze_module.h>
 #include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
@@ -19,7 +18,7 @@
 
 namespace torch::jit {
 
-void createFusionGroups(Block* block, AliasDb* aliasDb, size_t min_size);
+static void createFusionGroups(Block* block, AliasDb* aliasDb, size_t min_size);
 
 void fuseStaticSubgraphs(std::shared_ptr<Graph> graph, size_t min_size) {
   Inline(*graph);
@@ -60,7 +59,7 @@ static Operation createStaticSubgraphRuntime(const Node* node) {
   };
 }
 
-RegisterOperators StaticSubgraphOps({torch::jit::Operator(
+static RegisterOperators StaticSubgraphOps({torch::jit::Operator(
     prim::StaticSubgraph,
     createStaticSubgraphRuntime,
     AliasAnalysisKind::INTERNAL_SPECIAL_CASE)});

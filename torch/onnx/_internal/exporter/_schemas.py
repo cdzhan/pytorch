@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # A special value to indicate that the default value is not specified
 class _Empty:
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "_EMPTY_DEFAULT"
 
 
@@ -307,9 +307,9 @@ def _get_allowed_types_from_type_annotation(
         allowed_types = set()
         subtypes = typing.get_args(type_)
         for subtype in subtypes:
-            assert (
-                subtype is not type(None)
-            ), "Union should not contain None type because it is handled by _is_optional."
+            assert subtype is not type(None), (
+                "Union should not contain None type because it is handled by _is_optional."
+            )
             allowed_types.update(_get_allowed_types_from_type_annotation(subtype))
         return allowed_types
 
@@ -541,6 +541,7 @@ class OpSignature:
                 if (
                     return_param_name := _get_type_constraint_name(return_type_i)
                 ) in type_constraints:
+                    # pyrefly: ignore [index-error]
                     type_constraint = type_constraints[return_param_name]
                 else:
                     return_param_name = f"TReturn{i}"
@@ -553,6 +554,7 @@ class OpSignature:
                     type_constraints[return_param_name] = type_constraint
                 outputs.append(
                     Parameter(
+                        # pyrefly: ignore [bad-argument-type]
                         name=return_param_name,
                         type_constraint=type_constraint,
                         required=True,

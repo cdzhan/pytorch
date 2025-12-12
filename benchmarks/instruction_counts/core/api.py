@@ -66,7 +66,7 @@ class GroupedSetup:
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
-            assert field.type == str
+            assert field.type is str
             value: str = getattr(self, field.name)
             object.__setattr__(self, field.name, textwrap.dedent(value))
 
@@ -368,7 +368,7 @@ class GroupedBenchmark:
 
         return textwrap.dedent(
             f"""\
-            def model({', '.join(signature_args)}):
+            def model({", ".join(signature_args)}):
             {{stmt_str}}
                 return {signature_output}
         """
@@ -397,7 +397,7 @@ class GroupedBenchmark:
             cpp_invocation = textwrap.dedent(
                 f"""\
                 std::vector<torch::jit::IValue> ivalue_inputs({{
-                    {', '.join([f'torch::jit::IValue({a})' for a in signature_args])}
+                    {", ".join([f"torch::jit::IValue({a})" for a in signature_args])}
                 }});
                 {cpp_prefix}{model_name}.forward(ivalue_inputs);
             """

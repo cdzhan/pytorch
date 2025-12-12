@@ -1,3 +1,5 @@
+#include <torch/csrc/autograd/function.h>
+#include <torch/csrc/autograd/python_anomaly_mode.h>
 #include <torch/csrc/profiler/python/combined_traceback.h>
 #include <torch/csrc/python_headers.h>
 #include <torch/csrc/utils/pybind.h>
@@ -111,9 +113,119 @@ struct PythonTraceback : public CapturedTraceback::Python {
       }
     }
   }
+
+  // Extract forward traceback from the current autograd node's anomaly
+  // metadata. Returns a vector of strings representing the forward stack trace,
+  // or empty if not available.
+  std::vector<std::string> gatherForwardTraceback() override {
+    std::vector<std::string> result;
+
+    // Get the currently executing backward node
+    auto node = torch::autograd::get_current_node();
+    if (!node) {
+      return result;
+    }
+
+    // Get metadata from the node.
+    // Note: metadata() may create new metadata if it doesn't exist, but we need
+    // to check the dict for ANOMALY_TRACE_KEY anyway to know if forward tracing
+    // was actually enabled during forward pass.
+    auto* base_metadata = node->metadata();
+    if (!base_metadata) {
+      return result;
+    }
+
+    // Check if the metadata is a Python anomaly metadata (which contains the
+    // dict)
+    auto* metadata =
+        dynamic_cast<torch::autograd::PyAnomalyMetadata*>(base_metadata);
+    if (!metadata) {
+      return result;
+    }
+
+    // Get the traceback from the metadata dict
+    py::gil_scoped_acquire gil;
+    PyObject* dict = metadata->dict();
+    if (!dict || !PyDict_Check(dict)) {
+      return result;
+    }
+
+    PyObject* traceback = nullptr;
+    if (PyDict_GetItemStringRef(
+            dict,
+            torch::autograd::PyAnomalyMetadata::ANOMALY_TRACE_KEY,
+            &traceback) < 0) {
+      PyErr_Clear();
+      return result;
+    }
+
+    if (!traceback || !PyList_Check(traceback)) {
+      Py_XDECREF(traceback);
+      return result;
+    }
+
+    // Convert Python list of strings to vector of strings
+    Py_ssize_t size = PyList_Size(traceback);
+    result.reserve(size);
+    for (Py_ssize_t i = 0; i < size; ++i) {
+      PyObject* item = PyList_GetItem(traceback, i); // borrowed reference
+      if (item && PyUnicode_Check(item)) {
+        const char* str = PyUnicode_AsUTF8(item);
+        if (str) {
+          result.emplace_back(str);
+        }
+      }
+    }
+
+    Py_DECREF(traceback);
+    return result;
+  }
 };
 
 } // namespace
+
+std::vector<nlohmann::json> json_symbolize(
+    std::vector<CapturedTraceback*>& to_symbolize) {
+  std::unordered_map<CapturedTraceback*, uint64_t> cached_frames;
+  std::vector<CapturedTraceback*> unique_frames;
+  for (const auto& sc : to_symbolize) {
+    auto it = cached_frames.find(sc);
+    if (it == cached_frames.end()) {
+      cached_frames.try_emplace(sc, unique_frames.size());
+      unique_frames.push_back(sc);
+    }
+  }
+  auto s = symbolize(unique_frames);
+
+  std::string line_s = "line";
+  std::string name_s = "name";
+  std::string filename_s = "filename";
+  std::vector<nlohmann::json> all_frames;
+
+  for (const auto& f : s.all_frames) {
+    nlohmann::json d;
+    d[name_s] = f.funcname;
+    d[filename_s] = f.filename;
+    d[line_s] = f.lineno;
+    all_frames.emplace_back(std::move(d));
+  }
+
+  std::vector<nlohmann::json> py_unique_frames;
+  for (const auto& t : s.tracebacks) {
+    nlohmann::json l;
+    for (const auto& e : t) {
+      l.emplace_back(all_frames.at(e));
+    }
+    py_unique_frames.push_back(std::move(l));
+  }
+
+  std::vector<nlohmann::json> result;
+  result.reserve(to_symbolize.size());
+  for (const auto& sc : to_symbolize) {
+    result.push_back(py_unique_frames.at(cached_frames.at(sc)));
+  }
+  return result;
+}
 
 std::vector<py::object> py_symbolize(
     std::vector<CapturedTraceback*>& to_symbolize) {

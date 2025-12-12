@@ -28,6 +28,7 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/_fused_sdp_choice_native.h>
+#include <ATen/ops/_fused_sdp_choice_ops.h>
 #include <ATen/ops/_masked_softmax.h>
 #include <ATen/ops/_native_multi_head_attention_native.h>
 #include <ATen/ops/_nested_from_padded.h>
@@ -206,7 +207,7 @@ Tensor qkv_projection(
     } else {
       // encoder-decoder attention
       // TODO: is there a more efficient way to set this up?
-      // TODO: can we stay nested insted of using cat? Probably just make a
+      // TODO: can we stay nested instead of using cat? Probably just make a
       // NestedTensor out of the matmul results or something?
       auto q_kv_weight_s =
           at::native::split_with_sizes(qkv_weight, {embed_dim, embed_dim * 2}, 0);
@@ -448,6 +449,7 @@ REGISTER_AVX512_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp)
 REGISTER_VSX_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp)
 REGISTER_ZVECTOR_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp)
 REGISTER_SVE256_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cpp)
+REGISTER_HPU_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_meta)
 
 int64_t _fused_sdp_choice_meta(
     const Tensor& query_,
@@ -459,6 +461,20 @@ int64_t _fused_sdp_choice_meta(
     std::optional<double> scale,
     bool enable_gqa) {
   auto query_key_set = query_.key_set();
+  bool has_hpu = query_key_set.has(c10::DispatchKey::HPU);
+  if (has_hpu) {
+    auto choice_int = at::_ops::_fused_sdp_choice::redispatch(
+        c10::DispatchKeySet(DispatchKey::HPU),
+        query_,
+        key,
+        value,
+        attn_mask_,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa);
+    return choice_int;
+  }
 #if defined(USE_ROCM)
   bool has_rocm = query_key_set.has(c10::DispatchKey::HIP);
   if (has_rocm) {
@@ -556,7 +572,13 @@ std::optional<Tensor> convert_boolean_attn_mask_cudnn(const std::optional<Tensor
 template<int alignment>
 bool aligned_tensor(const at::Tensor& tensor){
   for(const auto i : c10::irange(tensor.dim() - 1)){
-    if(tensor.sym_stride(i) % alignment != 0){
+    auto stride = tensor.sym_stride(i).maybe_as_int();
+    // If the stride is unknown at compilation time, assume it is unaligned
+    // and always pad it. This is helpful to avoid unnecessary guards.
+    if (!stride)
+      return false;
+
+    if((*stride) % alignment != 0){
       return false;
     }
   }
@@ -592,8 +614,8 @@ at::Tensor preprocess_mask(
 // This causes the kernel to maybe alias query, key, value
 // So instead we pad the head_dimensions to be a multiple of 8 in the composite
 // region
-template <int alignment_size, bool slice>
-at::Tensor pad_last_dim(const at::Tensor& attn_bias) {
+template <bool slice>
+at::Tensor pad_last_dim(const at::Tensor& attn_bias, int alignment_size) {
   auto last_dim_size = attn_bias.sym_size(-1);
   if (last_dim_size % alignment_size == 0) {
     return attn_bias;
@@ -721,11 +743,13 @@ Tensor scaled_dot_product_attention(
       return std::get<0>(out_lse_softmax);
     }
     case SDPBackend::flash_attention: {
-      if(query_device_type == DeviceType::CUDA){
+      if(query_device_type == DeviceType::CUDA ||
+         query_device_type == DeviceType::XPU) {
         c10::SymInt og_size = query_.sym_size(-1);
-        Tensor query_padded = pad_last_dim<8, false>(query_);
-        Tensor key_padded = pad_last_dim<8, false>(key);
-        Tensor value_padded = pad_last_dim<8, false>(value);
+        int alignment_size = (query_device_type == DeviceType::XPU) ? 64 : 8;
+        Tensor query_padded = pad_last_dim<false>(query_, alignment_size);
+        Tensor key_padded = pad_last_dim<false>(key, alignment_size);
+        Tensor value_padded = pad_last_dim<false>(value, alignment_size);
         // We need to calculate the scale based off the OG head dim size
         auto og_scale = sdp::calculate_scale(query_, scale);
         auto out_lse_softmax = at::_scaled_dot_product_flash_attention(
@@ -752,13 +776,47 @@ Tensor scaled_dot_product_attention(
     }
     case SDPBackend::math: {
 #ifdef USE_MPS
+      TORCH_CHECK_NOT_IMPLEMENTED(
+        c10::isFloatingType(query_.scalar_type()),
+        "scaled_dot_product_attention for MPS does not support dtype ",
+        query_.scalar_type());
+      TORCH_CHECK_NOT_IMPLEMENTED(
+        c10::isFloatingType(key.scalar_type()),
+        "scaled_dot_product_attention for MPS does not support dtype ",
+        key.scalar_type());
+      TORCH_CHECK_NOT_IMPLEMENTED(
+        c10::isFloatingType(value.scalar_type()),
+        "scaled_dot_product_attention for MPS does not support dtype ",
+        value.scalar_type());
       const auto any_nested = query_.is_nested() || key.is_nested() || value.is_nested();
       const bool any_inputs_require_grad = query_.requires_grad() || key.requires_grad() || value.requires_grad();
-      const auto all_contiguous = query_.is_contiguous() && key.is_contiguous() && value.is_contiguous();
+      const auto all_contiguous = query_.is_contiguous_or_false() && key.is_contiguous_or_false() && value.is_contiguous_or_false();
       if (query_device_type == DeviceType::MPS && dropout_p == 0.0
           && !(GradMode::is_enabled() && any_inputs_require_grad)
           && (all_contiguous || mps::is_macos_13_or_newer(mps::MacOSVersion::MACOS_VER_15_0_PLUS))
           && !any_nested) {
+        if (enable_gqa) {
+          int64_t q_heads = query_.size(-3);
+          int64_t k_heads = key.size(-3);
+          int64_t repeat_factor = q_heads / k_heads;
+
+          if (repeat_factor > 1) {
+            TORCH_CHECK(q_heads % k_heads == 0,
+                          "For GQA, the query tensor's head dimension (" + std::to_string(q_heads) +
+                                    ") must be divisible by the key tensor's head dimension (" + std::to_string(k_heads) + ").");
+            auto repeated_key = key.repeat_interleave(repeat_factor, /*dim=*/-3);
+            auto repeated_value = value.repeat_interleave(repeat_factor, /*dim=*/-3);
+            return std::get<0>(at::_scaled_dot_product_attention_math_for_mps(
+              query_,
+              repeated_key,
+              repeated_value,
+              attn_mask,
+              dropout_p,
+              is_causal,
+              std::nullopt, /*dropout_mask*/
+              scale));
+          }
+        }
         return std::get<0>(at::_scaled_dot_product_attention_math_for_mps(
             query_,
             key,

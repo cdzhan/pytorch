@@ -15,6 +15,7 @@ from torch.distributed.checkpoint.filesystem import (
     FileSystemBase,
     FileSystemReader,
     FileSystemWriter,
+    SerializationFormat,
 )
 
 
@@ -36,7 +37,8 @@ class FileSystem(FileSystemBase):
     def create_stream(
         self, path: Union[str, os.PathLike], mode: str
     ) -> Generator[io.IOBase, None, None]:
-        assert self.fs is not None
+        if self.fs is None:
+            raise AssertionError("fs should not be None")
         path = os.fspath(path)
 
         # fsspec does not support concurrent transactions, and not all
@@ -90,6 +92,11 @@ class FileSystem(FileSystemBase):
     def rm_file(self, path: Union[str, os.PathLike]) -> None:
         self.fs.rm(path)
 
+    def ls(self, path: Union[str, os.PathLike]) -> list[str]:
+        # setting detail to False explicitly to keep the list[str] return type,
+        # instead of the list[Dict] return type when detail=True
+        return self.fs.ls(path, detail=False)
+
 
 # TODO: add the dcp.async_save mixin
 class FsspecWriter(FileSystemWriter):
@@ -115,6 +122,7 @@ class FsspecWriter(FileSystemWriter):
         per_thread_copy_ahead: int = 10_000_000,
         overwrite: bool = True,
         _extensions: Optional[Sequence[StreamTransformExtension]] = None,
+        serialization_format: SerializationFormat = SerializationFormat.TORCH_SAVE,
         **kwargs,
     ) -> None:
         """
@@ -139,6 +147,7 @@ class FsspecWriter(FileSystemWriter):
             per_thread_copy_ahead,
             overwrite=overwrite,
             _extensions=_extensions,
+            serialization_format=serialization_format,
         )
         self.fs = FileSystem()
         self.path = self.fs.init_path(path, **kwargs)

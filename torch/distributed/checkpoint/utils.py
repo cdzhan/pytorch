@@ -5,11 +5,11 @@ import io
 import itertools
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from functools import wraps
 from pstats import Stats
-from typing import Any, Callable, cast, Optional, TypeVar, Union
+from typing import Any, cast, Optional, TypeVar, Union
 
 import torch
 import torch.distributed as dist
@@ -32,7 +32,7 @@ R = TypeVar("R")
 
 
 def _get_failure_dict(
-    results: list[Union[T, WRAPPED_EXCEPTION]]
+    results: list[Union[T, WRAPPED_EXCEPTION]],
 ) -> dict[int, WRAPPED_EXCEPTION]:
     return cast(
         dict[int, WRAPPED_EXCEPTION],
@@ -92,9 +92,15 @@ class _DistWrapper:
         self.use_dist = use_dist
         self.coordinator_rank = coordinator_rank
         if self.use_dist:
+            self.global_coordinator_rank = (
+                dist.get_global_rank(group, coordinator_rank)
+                if group is not None
+                else coordinator_rank
+            )
             self.rank = dist.get_rank(group)
             self.is_coordinator = self.rank == coordinator_rank
         else:
+            self.global_coordinator_rank = 0
             self.rank = 0
             self.is_coordinator = True
 
@@ -113,7 +119,7 @@ class _DistWrapper:
             dist.broadcast_object_list(
                 object_list=object_list,
                 group=self.group,
-                src=self.coordinator_rank,
+                src=self.global_coordinator_rank,
             )
         return cast(T, object_list[0])
 
@@ -129,7 +135,7 @@ class _DistWrapper:
             dist.gather_object(
                 obj=object,
                 object_gather_list=gather_objs if self.is_coordinator else None,
-                dst=self.coordinator_rank,
+                dst=self.global_coordinator_rank,
                 group=self.group,
             )
             result = gather_objs
@@ -156,13 +162,14 @@ class _DistWrapper:
             dist.scatter_object_list(
                 scatter_object_output_list=gather_result,
                 scatter_object_input_list=object_list if self.is_coordinator else None,
-                src=self.coordinator_rank,
+                src=self.global_coordinator_rank,
                 group=self.group,
             )
 
             local_reply = gather_result[0]
         else:
-            assert object_list is not None
+            if object_list is None:
+                raise AssertionError("object_list is None")
             local_reply = object_list[0]
         return local_reply
 
@@ -184,13 +191,14 @@ class _DistWrapper:
         local_data: Union[WRAPPED_EXCEPTION, T]
         try:
             local_data = map_fun()
-        except BaseException as e:
+        except BaseException as e:  # noqa: B036
             local_data = _wrap_exception(e)
 
         all_data = self.gather_object(local_data)
         all_results: Optional[list[Union[R, CheckpointException]]] = None
         if self.is_coordinator:
-            assert all_data is not None
+            if all_data is None:
+                raise AssertionError("all_data is None")
             node_failures = _get_failure_dict(all_data)
 
             if len(node_failures) == 0:
@@ -200,7 +208,7 @@ class _DistWrapper:
                         list[Union[R, CheckpointException]],
                         reduce_fun(cast(list[T], all_data)),
                     )
-                except BaseException as e:
+                except BaseException as e:  # noqa: B036
                     node_failures[self.rank] = _wrap_exception(e)
 
             if len(node_failures) > 0:
@@ -231,23 +239,25 @@ class _DistWrapper:
         local_data: Union[T, WRAPPED_EXCEPTION]
         try:
             local_data = map_fun()
-        except BaseException as e:
+        except BaseException as e:  # noqa: B036
             local_data = _wrap_exception(e)
 
         all_data = self.gather_object(local_data)
         result: Optional[Union[R, CheckpointException]] = None
         if self.is_coordinator:
-            assert all_data is not None
+            if all_data is None:
+                raise AssertionError("all_data is None")
             node_failures = _get_failure_dict(all_data)
             if len(node_failures) == 0:
                 try:
                     result = reduce_fun(cast(list[T], all_data))
-                except BaseException as e:
+                except BaseException as e:  # noqa: B036
                     node_failures[self.rank] = _wrap_exception(e)
 
             if len(node_failures) > 0:
                 result = CheckpointException(step, node_failures)
 
+        # pyrefly: ignore [bad-argument-type]
         final_result = self.broadcast_object(result)
         if isinstance(final_result, CheckpointException):
             raise final_result
@@ -268,7 +278,7 @@ class _DistWrapper:
         result: Union[T, WRAPPED_EXCEPTION]
         try:
             result = map_fun()
-        except BaseException as e:
+        except BaseException as e:  # noqa: B036
             result = _wrap_exception(e)
 
         all_results = self.all_gather_object(result)
@@ -294,12 +304,23 @@ class _DistWrapper:
         if self.is_coordinator:
             try:
                 result = map_fun()
-            except BaseException as e:
+            except BaseException as e:  # noqa: B036
                 result = CheckpointException(step, {self.rank: _wrap_exception(e)})
+        # pyrefly: ignore [bad-argument-type]
         final_result = self.broadcast_object(result)
         if isinstance(final_result, CheckpointException):
             raise final_result
         return cast(T, final_result)
+
+    def barrier(self) -> None:
+        """
+        Add a synchronization point across all processes when using distributed.
+        If torch.distributed is initialized, this function will invoke a barrier across the global process group.
+        If torch.distributed is not initialized, this function is a no-op.
+        """
+        if not self.use_dist:
+            return
+        dist.barrier(group=self.group)
 
 
 def _find_shard(tensor: ShardedTensor, index: MetadataIndex) -> Shard:
@@ -420,7 +441,7 @@ ENABLE_PROFILE = False
 @contextmanager
 def _profile():
     # Only log the profiling when it is enable and is on rank0  or dist is not
-    # avaiable.
+    # available.
     if ENABLE_PROFILE and (not dist.is_available() or dist.get_rank() == 0):
         profiler = cProfile.Profile()
         profiler.enable()
@@ -440,17 +461,20 @@ def _api_bc_check(func):
         if len(args) == 2:
             warnings.warn(
                 f"The argument order of {func.__name__} has been changed. "
-                "Please check the document to avoid future breakages."
+                "Please check the document to avoid future breakages.",
+                stacklevel=2,
             )
             sig = inspect.signature(func)
             kwonlyargs = [
                 p.name for p in sig.parameters.values() if p.kind == p.KEYWORD_ONLY
             ]
             if "storage_writer" in kwonlyargs:
-                assert "storage_writer" not in kwargs, (args, kwargs)
+                if "storage_writer" in kwargs:
+                    raise AssertionError(f"storage_writer in kwargs: {(args, kwargs)}")
                 kwargs["storage_writer"] = args[1]
             elif "storage_reader" in kwonlyargs:
-                assert "storage_reader" not in kwargs, (args, kwargs)
+                if "storage_reader" in kwargs:
+                    raise AssertionError(f"storage_reader in kwargs: {(args, kwargs)}")
                 kwargs["storage_reader"] = args[1]
             else:
                 raise RuntimeError(f"Unexpected kwonlyargs = {kwonlyargs}")

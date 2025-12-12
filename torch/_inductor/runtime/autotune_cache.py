@@ -1,3 +1,28 @@
+"""
+PyTorch Inductor Autotuning Cache System
+
+This module implements a caching system for autotuning configurations in PyTorch's Inductor compiler.
+It provides mechanisms to store and retrieve optimal kernel configurations both locally and remotely,
+which significantly speeds up compilation by reusing previously discovered optimal parameters.
+
+The caching system includes:
+- Local filesystem caching for individual machine reuse
+- Remote caching for sharing optimizations across machines
+- Bundled caching to efficiently store multiple related configurations
+- Cache invalidation based on PyTorch versions and backend changes
+- Serialization/deserialization support for worker processes
+
+Key components:
+- AutotuneCache: Main class for managing cache access and storage
+- AutotuneCacheBundler: Bundles multiple cache entries for efficient storage
+- LocalAutotuneCache: Handles filesystem-based caching
+- _LocalAutotuneCacheBackend: Low-level file operations for cache storage
+- AutotuneCacheArtifact: Integration with PyTorch's artifact system
+
+This caching system is critical for performance as it eliminates the need to re-run
+expensive autotuning operations when the same kernels are compiled multiple times.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -6,11 +31,16 @@ import logging
 import os
 import os.path
 import re
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 from typing_extensions import override
 
 import torch
-from torch.compiler._cache import CacheArtifactManager, CacheArtifactType
+from torch._inductor.runtime.runtime_utils import cache_dir
+from torch.compiler._cache import (
+    CacheArtifact,
+    CacheArtifactFactory,
+    CacheArtifactManager,
+)
 from torch.utils._triton import has_triton
 
 from ..remote_cache import (
@@ -20,7 +50,7 @@ from ..remote_cache import (
     RemoteCacheBackend,
     RemoteCacheJsonSerde,
 )
-from .triton_compat import Config
+from .triton_compat import Config, HAS_WARP_SPEC
 
 
 if TYPE_CHECKING:
@@ -59,19 +89,43 @@ def inductor_meta_from_config() -> _InductorMetaTy:
     }
 
 
+@CacheArtifactFactory.register
+class AutotuneCacheArtifact(CacheArtifact):
+    @override
+    def populate_cache(self) -> None:
+        autotune_cache = _LocalAutotuneCacheBackend()
+        key = os.path.join(cache_dir(), self.key)
+        autotune_cache._put(key, self.content)
+
+    @override
+    @staticmethod
+    def type() -> str:
+        return "autotune"
+
+    @override
+    @staticmethod
+    def encode(content: JsonDataTy) -> bytes:
+        assert not isinstance(content, bytes)
+        serde = RemoteCacheJsonSerde()
+        content_bytes = serde.encode(content)
+        assert isinstance(content_bytes, bytes)
+        return content_bytes
+
+
 @dataclasses.dataclass
 class AutotuneCache:
     configs_hash: str
-    local_cache: Optional[tuple[RemoteCache[JsonDataTy], str]] = None
-    remote_cache: Optional[tuple[RemoteCache[JsonDataTy], str]] = None
+    local_cache: tuple[RemoteCache[JsonDataTy], str] | None = None
+    remote_cache: tuple[RemoteCache[JsonDataTy], str] | None = None
 
     # Create a AutotuneCache. Returns None if none of the caches can be used.
     @staticmethod
     def create(
         inductor_meta: _InductorMetaTy, filename: str, configs_hash: str
-    ) -> Optional[AutotuneCache]:
+    ) -> AutotuneCache | None:
         cache = AutotuneCache(configs_hash)
         key = AutotuneCache._prepare_key(filename)
+
         cache._setup_local_cache(inductor_meta, os.path.dirname(filename), key)
         cache._setup_remote_autotune_cache(inductor_meta, key)
         if cache.local_cache or cache.remote_cache:
@@ -88,7 +142,7 @@ class AutotuneCache:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     # Read the best config options from the most local cache and return it.
-    def _read(self) -> Optional[dict[str, JsonDataTy]]:
+    def _read(self) -> dict[str, JsonDataTy] | None:
         if local_cache := self.local_cache:
             cache, key = local_cache
             if best_config := cache.get(key):
@@ -107,7 +161,7 @@ class AutotuneCache:
     # which `configs` represents that option.
     def read_best(
         self, inductor_meta: _InductorMetaTy, configs: list[Config]
-    ) -> Optional[Config]:
+    ) -> Config | None:
         if best := self._read():
             return _load_cached_autotuning(
                 best, self.configs_hash, configs, inductor_meta
@@ -121,7 +175,21 @@ class AutotuneCache:
         if not inductor_meta.get("autotune_local_cache", True):
             return
 
-        cache_filename = f"{dirname}/{cache_key}.best_config"
+        from ..codecache import torch_key
+
+        """
+        [Note: torch_key in autotune cache key]
+        Include torch_key() in the cache key so that different versions
+        of torch result in cache invalidation. This is important in case
+        of changes to the best_config format or other code changes that
+        are not backward compatible w.r.t. the cache.
+        """
+        hasher = hashlib.sha256()
+        hasher.update(cache_key.encode("utf-8"))
+        hasher.update(torch_key())
+        updated_cache_key = hasher.hexdigest()
+
+        cache_filename = f"{dirname}/{updated_cache_key}.best_config"
         local_cache = LocalAutotuneCache()
         self.local_cache = (local_cache, cache_filename)
 
@@ -139,10 +207,13 @@ class AutotuneCache:
             return
         assert isinstance(backend_hash, str)
 
+        from ..codecache import torch_key
+
         is_fbcode = bool(inductor_meta.get("is_fbcode", False))
 
         salt = "autotune-best-config-v2"
-        key = backend_hash + self.configs_hash + salt
+        # re: torch_key - see [Note: torch_key in autotune cache key]
+        key = torch_key().hex() + backend_hash + self.configs_hash + salt
         key = hashlib.sha256(key.encode("utf-8")).hexdigest()
 
         remote_cache = create_cache(
@@ -197,23 +268,41 @@ class AutotuneCache:
 
     # Save the config in the caches
     def save(
-        self, config: Config, time_taken_ns: int, found_by_coordesc: bool = False
+        self,
+        config: Config,
+        time_taken_ns: int,
+        found_by_coordesc: bool = False,
+        triton_cache_hash: str | None = None,
     ) -> None:
         data = {
+            # pyrefly: ignore [missing-attribute]
             **config.kwargs,
+            # pyrefly: ignore [missing-attribute]
             "num_warps": config.num_warps,
+            # pyrefly: ignore [missing-attribute]
             "num_stages": config.num_stages,
             "configs_hash": self.configs_hash,
             "found_by_coordesc": found_by_coordesc,
             "time_taken_ms": time_taken_ns // 1000000,  # Convert from NS to MS
+            "triton_cache_hash": triton_cache_hash,
         }
+        if HAS_WARP_SPEC:
+            data.update(
+                {
+                    "num_consumer_groups": getattr(config, "num_consumer_groups", 0),
+                    "num_buffers_warp_spec": getattr(
+                        config, "num_buffers_warp_spec", 0
+                    ),
+                }
+            )
 
         if local_cache := self.local_cache:
             cache, key = local_cache
             cache.put(key, data)
             AutotuneCacheBundler.put(key, data)
+            autotune_artifact_key = os.path.join(*key.split(os.sep)[-2:])
             CacheArtifactManager.record_artifact(
-                CacheArtifactType.AUTOTUNE, os.path.basename(key), data
+                AutotuneCacheArtifact.type(), autotune_artifact_key, data
             )
 
             if log.isEnabledFor(logging.DEBUG):
@@ -328,7 +417,7 @@ class _AutotuneCacheBundlerImpl:
 
 
 class AutotuneCacheBundler:
-    _bundler: Optional[_AutotuneCacheBundlerImpl] = None
+    _bundler: _AutotuneCacheBundlerImpl | None = None
 
     def __init__(self) -> None:
         pass
@@ -341,8 +430,8 @@ class AutotuneCacheBundler:
         cls,
         inductor_meta: _InductorMetaTy,
         *,
-        code: Optional[str] = None,
-        code_hash: Optional[str] = None,
+        code: str | None = None,
+        code_hash: str | None = None,
     ) -> None:
         assert cls._bundler is None
 
@@ -450,7 +539,7 @@ def _load_cached_autotuning(
     configs_hash: str,
     configs: list[Config],
     inductor_meta: _InductorMetaTy,
-) -> Optional[Config]:
+) -> Config | None:
     if best_config is None:
         return None
     if best_config.pop("configs_hash", None) != configs_hash:
@@ -459,20 +548,45 @@ def _load_cached_autotuning(
     # Remove time taken for comparison
     best_config.pop("time_taken_ms", None)
 
+    best_config.pop("triton_cache_hash", None)
+
     if inductor_meta.get("coordinate_descent_tuning") and best_config.pop(
         "found_by_coordesc", False
     ):
         num_warps = best_config.pop("num_warps")
         num_stages = best_config.pop("num_stages")
-        triton_config = Config(best_config, num_warps=num_warps, num_stages=num_stages)
+
+        # Extract common arguments
+        config_args = {
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
+        if HAS_WARP_SPEC:
+            config_args.update(
+                {
+                    "num_consumer_groups": best_config.pop("num_consumer_groups", 0),
+                    "num_buffers_warp_spec": best_config.pop(
+                        "num_buffers_warp_spec", 0
+                    ),
+                }
+            )
+
+        # Create the triton_config with the appropriate arguments
+        # pyrefly: ignore [bad-argument-count]
+        triton_config = Config(best_config, **config_args)
+        # pyrefly: ignore [missing-attribute]
         triton_config.found_by_coordesc = True
         return triton_config
 
     matching_configs = [
         cfg
         for cfg in configs
+        # pyrefly: ignore [missing-attribute]
         if all(val == best_config.get(key) for key, val in cfg.kwargs.items())
+        # pyrefly: ignore [missing-attribute]
         and cfg.num_warps == best_config.get("num_warps")
+        # pyrefly: ignore [missing-attribute]
         and cfg.num_stages == best_config.get("num_stages")
     ]
     if len(matching_configs) != 1:
@@ -483,7 +597,7 @@ def _load_cached_autotuning(
 
 class _LocalAutotuneCacheBackend(RemoteCacheBackend[bytes]):
     @override
-    def _get(self, key: str) -> Optional[bytes]:
+    def _get(self, key: str) -> bytes | None:
         try:
             with open(key, "rb") as fd:
                 return fd.read()
@@ -493,8 +607,9 @@ class _LocalAutotuneCacheBackend(RemoteCacheBackend[bytes]):
     @override
     def _put(self, key: str, data: bytes) -> None:
         os.makedirs(os.path.dirname(key), exist_ok=True)
-        with open(key, "wb") as fd:
-            fd.write(data)
+        from torch._inductor import codecache
+
+        codecache.write_atomic(key, data)
 
 
 class LocalAutotuneCache(RemoteCache[JsonDataTy]):
@@ -504,7 +619,7 @@ class LocalAutotuneCache(RemoteCache[JsonDataTy]):
         super().__init__(backend, serde)
 
     @override
-    def _get(self, key: str, sample: Optional[Sample]) -> Optional[JsonDataTy]:
+    def _get(self, key: str, sample: Sample | None) -> JsonDataTy | None:
         AutotuneCacheBundler.sync()
         result = super()._get(key, sample)
         if result is not None:
@@ -515,13 +630,14 @@ class LocalAutotuneCache(RemoteCache[JsonDataTy]):
             # model would only bundle *newly* compiled kernels, not existing
             # kernels that were already compiled and cached.
             AutotuneCacheBundler.put(key, result)
+            autotune_artifact_key = os.path.join(*key.split(os.sep)[-2:])
             CacheArtifactManager.record_artifact(
-                CacheArtifactType.AUTOTUNE, os.path.basename(key), result
+                AutotuneCacheArtifact.type(), autotune_artifact_key, result
             )
         return result
 
     @override
-    def _put(self, key: str, value: JsonDataTy, sample: Optional[Sample]) -> None:
+    def _put(self, key: str, value: JsonDataTy, sample: Sample | None) -> None:
         AutotuneCacheBundler.put(key, value)
         super()._put(key, value, sample)
 

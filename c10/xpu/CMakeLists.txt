@@ -24,6 +24,7 @@ set(C10_XPU_HEADERS
     XPUCachingAllocator.h
     XPUDeviceProp.h
     XPUException.h
+    XPUEvent.h
     XPUFunctions.h
     XPUMacros.h
     XPUStream.h
@@ -31,6 +32,7 @@ set(C10_XPU_HEADERS
 )
 if(NOT BUILD_LIBTORCHLESS)
   add_library(c10_xpu ${C10_XPU_SRCS} ${C10_XPU_HEADERS})
+  torch_compile_options(c10_xpu)
   target_compile_options(c10_xpu PRIVATE "-DC10_XPU_BUILD_MAIN_LIB")
   # Enable hidden visibility if compiler supports it.
   if(${COMPILER_SUPPORTS_HIDDEN_VISIBILITY})
