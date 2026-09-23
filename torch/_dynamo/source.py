@@ -21,7 +21,7 @@ import dataclasses
 import enum
 import functools
 from collections.abc import Callable
-from typing import Any, Optional, TYPE_CHECKING, Union
+from typing import Any, TYPE_CHECKING
 
 from torch import device as device_type
 from torch._guards import (
@@ -118,7 +118,7 @@ def is_constant_source(source: Source) -> bool:
     return False
 
 
-def _get_source_debug_name(source: Optional[Source]) -> str:
+def _get_source_debug_name(source: Source | None) -> str:
     if source is None:
         return "<unknown source>"
     else:
@@ -128,7 +128,7 @@ def _get_source_debug_name(source: Optional[Source]) -> str:
             return "<unknown source>"
 
 
-def _esc_str(s: Any, apply_repr: bool = False) -> str:
+def _esc_str(s: object, apply_repr: bool = False) -> str:
     """
     Escapes curly brackets for format strings.
     e.g. "frozenset({0})" becomes "frozenset({{0}})".
@@ -152,18 +152,35 @@ class LocalSource(Source):
 
     # Whether we know this input is dynamic (based on example_inputs)
     # For non tensors, we simply look at the first index of the tuple
-    dynamism: Optional[frozenset[str]] = None
+    dynamism: frozenset[tuple[str, tuple[bool, ...]]] | None = None
 
     # Whether the item at this source is the _content_ of a cell that is
     # dereferenced from the root frame, i.e., it's a part of the `co_cellvars`
     # or `co_freevars`.
     is_derefed_cell_contents: bool = False
 
+    # Whether this local is the function's varargs (``*args``) parameter.
+    # Set from ``co_flags & CO_VARARGS`` at frame-entry time. Element accesses
+    # like ``args[N]`` produce a ``GetItemSource`` whose base has this flag.
+    # Useful for distinguishing ``*args`` from a regular list-typed input.
+    # ``repr=False`` so the vast majority of locals (which are not varargs) do
+    # not get a noisy ``is_varargs=False`` in every debug string.
+    is_varargs: bool = dataclasses.field(default=False, repr=False)
+
+    # Whether this local is the function's varkw (``**kwargs``) parameter.
+    # Set from ``co_flags & CO_VARKEYWORDS`` at frame-entry time. Element
+    # accesses like ``kwargs["k"]`` produce a ``DictGetItemSource`` whose base
+    # has this flag. ``repr=False`` for the same reason as ``is_varargs``.
+    is_varkw: bool = dataclasses.field(default=False, repr=False)
+
     def reconstruct(self, codegen: "PyCodegen") -> None:
         if self.is_derefed_cell_contents:
             codegen.load_deref(self.local_name)
         else:
             codegen.append_output(codegen.create_load(self.local_name))
+
+    def reconstruct_pycode(self, codegen: "PyCodegen") -> str:
+        return self.local_name
 
     @property
     def guard_source(self) -> GuardSource:
@@ -234,6 +251,9 @@ class GlobalSource(Source):
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.append_output(codegen.create_load_global(self.global_name, add=True))
 
+    def reconstruct_pycode(self, codegen: "PyCodegen") -> str:
+        return self.global_name
+
     @property
     def guard_source(self) -> GuardSource:
         return GuardSource.GLOBAL
@@ -285,17 +305,26 @@ class AttrSource(ChainedSource):
     member: str
 
     def __post_init__(self) -> None:
-        assert self.base, "Can't construct an AttrSource without a valid base source"
-        if "." in self.member:
-            member_parts = self.member.split(".")
-            object.__setattr__(
-                self, "base", AttrSource(self.base, ".".join(member_parts[:-1]))
+        if not self.base:
+            raise AssertionError(
+                "Can't construct an AttrSource without a valid base source"
             )
-            object.__setattr__(self, "member", member_parts[-1])
+        if "." in self.member:
+            raise AssertionError(
+                f"AttrSource member must not contain '.', got {self.member!r}. "
+                "Use OutputGraph.get_chained_attr_source() for dotted paths."
+            )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen(self.base)
         codegen.extend_output(codegen.create_load_attrs(self.member))
+
+    def reconstruct_pycode(self, codegen: "PyCodegen") -> str:
+        base = self.base.reconstruct_pycode(codegen)
+        if self.member.isidentifier():
+            return f"{base}.{self.member}"
+        else:
+            return f"getattr({base}, {self.member!r})"
 
     @functools.cached_property
     def _name_template(self) -> str:
@@ -305,17 +334,39 @@ class AttrSource(ChainedSource):
 
 
 @dataclass_with_cached_hash(frozen=True)
+class CellContentsSource(AttrSource):
+    """
+    Source for closure cell contents that also stores the freevar name.
+    This allows guard failure messages to show which variable the closure cell refers to.
+    """
+
+    freevar_name: str = dataclasses.field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.base:
+            raise AssertionError(
+                "Can't construct a CellContentsSource without a valid base source"
+            )
+        if self.member != "cell_contents":
+            raise AssertionError(
+                "CellContentsSource should only be used for cell_contents"
+            )
+
+
+@dataclass_with_cached_hash(frozen=True)
 class GenericAttrSource(ChainedSource):
     member: str
 
     def __post_init__(self) -> None:
-        assert self.base, "Can't construct an AttrSource without a valid base source"
-        if "." in self.member:
-            member_parts = self.member.split(".")
-            object.__setattr__(
-                self, "base", AttrSource(self.base, ".".join(member_parts[:-1]))
+        if not self.base:
+            raise AssertionError(
+                "Can't construct a GenericAttrSource without a valid base source"
             )
-            object.__setattr__(self, "member", member_parts[-1])
+        if "." in self.member:
+            raise AssertionError(
+                f"GenericAttrSource member must not contain '.', got {self.member!r}. "
+                "Use OutputGraph.get_chained_attr_source() for dotted paths."
+            )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen(self.base)
@@ -338,9 +389,9 @@ class TypeDictSource(ChainedSource):
     @property
     def _name_template(self) -> str:
         # type(ob).__dict__ can return a proxy of the dict. But in the C++
-        # guard accessor, we are use type->tp_dict which is a dict. So,
+        # guard accessor, we use type->tp_dict which is a dict. So,
         # forcefully pass a dict object to ensure that the GuardManager
-        # registers that its working on a dict object.
+        # registers that it's working on a dict object.
         return "dict({0}.__dict__)"
 
 
@@ -440,7 +491,7 @@ class UnspecializedParamBufferSource(AttrSource):
 # present within the final view shape metadata.
 @dataclass_with_cached_hash(frozen=True)
 class EphemeralSource(Source):
-    desc: Optional[str] = None
+    desc: str | None = None
 
     @property
     def guard_source(self) -> GuardSource:
@@ -487,14 +538,21 @@ class TensorProperty(enum.Enum):
 @dataclass_with_cached_hash(frozen=True)
 class TensorPropertySource(ChainedSource):
     prop: TensorProperty
-    idx: Optional[int] = None  # None for STORAGE_OFFSET
+    idx: int | None = None  # None for STORAGE_OFFSET
 
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("TensorPropertySource base must not be None")
         if self.prop is TensorProperty.STORAGE_OFFSET:
-            assert self.idx is None
+            if self.idx is not None:
+                raise AssertionError(
+                    "idx must be None for STORAGE_OFFSET TensorProperty"
+                )
         else:
-            assert self.idx is not None
+            if self.idx is None:
+                raise AssertionError(
+                    f"idx must not be None for {self.prop} TensorProperty"
+                )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.add_push_null(
@@ -517,7 +575,10 @@ class TensorPropertySource(ChainedSource):
         elif self.prop is TensorProperty.STRIDE:
             return f"{{0}}.stride()[{_esc_str(self.idx)}]"
         elif self.prop is TensorProperty.STORAGE_OFFSET:
-            assert self.idx is None
+            if self.idx is not None:
+                raise AssertionError(
+                    "idx must be None for STORAGE_OFFSET TensorProperty"
+                )
             return "{0}.storage_offset()"
         else:
             raise AssertionError(f"unhandled {_esc_str(self.prop)}")
@@ -528,7 +589,8 @@ class IndexedSource(ChainedSource):
     idx: int
 
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("IndexedSource base must not be None")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         raise NotImplementedError
@@ -541,7 +603,8 @@ class IndexedSource(ChainedSource):
 @dataclass_with_cached_hash(frozen=True)
 class NegateSource(ChainedSource):
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("NegateSource base must not be None")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         raise NotImplementedError
@@ -555,7 +618,8 @@ class NegateSource(ChainedSource):
 @dataclass_with_cached_hash(frozen=True)
 class ConvertIntSource(ChainedSource):
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("ConvertIntSource base must not be None")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen(self.base)
@@ -570,7 +634,8 @@ class DynamicScalarSource(ChainedSource):
     is_int: bool
 
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("DynamicScalarSource base must not be None")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         # Integer casting at reconstruction helps reduce the amount of DynamicInts returned
@@ -589,7 +654,8 @@ class DynamicScalarSource(ChainedSource):
 @dataclass_with_cached_hash(frozen=True)
 class FlattenScriptObjectSource(ChainedSource):
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("FlattenScriptObjectSource base must not be None")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen(self.base)
@@ -602,7 +668,10 @@ class FlattenScriptObjectSource(ChainedSource):
 @dataclass_with_cached_hash(frozen=True)
 class ScriptObjectQualifiedNameSource(ChainedSource):
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError(
+                "ScriptObjectQualifiedNameSource base must not be None"
+            )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen(self.base)
@@ -623,17 +692,21 @@ class AttrProxySource(ChainedSource):
 
 @dataclass_with_cached_hash(frozen=True)
 class DefaultsSource(ChainedSource):
-    idx_key: Union[int, str]
+    idx_key: int | str
     is_kw: bool = False
     field: str = dataclasses.field(init=False, repr=False, compare=False)
     _name: str = dataclasses.field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        assert self.base, (
-            "Base must be a valid source in order to properly track and guard this Defaults to its origin."
-        )
+        if not self.base:
+            raise AssertionError(
+                "Base must be a valid source in order to properly track and guard this Defaults to its origin."
+            )
         if self.is_kw:
-            assert isinstance(self.idx_key, str)
+            if not isinstance(self.idx_key, str):
+                raise AssertionError(
+                    f"idx_key must be a str for keyword defaults, got {type(self.idx_key)}"
+                )
             object.__setattr__(self, "field", "__kwdefaults__")
             object.__setattr__(
                 self,
@@ -641,7 +714,10 @@ class DefaultsSource(ChainedSource):
                 f"{{0}}.{_esc_str(self.field)}['{_esc_str(self.idx_key)}']",
             )
         else:
-            assert isinstance(self.idx_key, int)
+            if not isinstance(self.idx_key, int):
+                raise AssertionError(
+                    f"idx_key must be an int for positional defaults, got {type(self.idx_key)}"
+                )
             object.__setattr__(self, "field", "__defaults__")
             object.__setattr__(
                 self, "_name", f"{{0}}.{_esc_str(self.field)}[{_esc_str(self.idx_key)}]"
@@ -660,11 +736,12 @@ class DefaultsSource(ChainedSource):
 
 @dataclass_with_cached_hash(frozen=True)
 class GetItemSource(ChainedSource):
-    index: Any
+    index: object
     index_is_slice: bool = False
 
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("GetItemSource base must not be None")
         if isinstance(self.index, slice):
             # store the hashable version of the slice so the whole GetItemSource is hashable
             super().__setattr__("index", self.index.__reduce__())
@@ -679,7 +756,15 @@ class GetItemSource(ChainedSource):
         codegen.append_output(create_binary_subscr())
 
     def unpack_slice(self) -> slice:
-        assert self.index_is_slice
+        if not self.index_is_slice:
+            raise AssertionError("unpack_slice called but index is not a slice")
+        if not (
+            isinstance(self.index, tuple)
+            and len(self.index) == 2
+            and self.index[0] is slice
+            and isinstance(self.index[1], tuple)
+        ):
+            raise AssertionError(f"Expected an encoded slice, got {self.index!r}")
         slice_class, slice_args = self.index
         return slice_class(*slice_args)
 
@@ -688,7 +773,10 @@ class GetItemSource(ChainedSource):
         # Index can be of following types
         # 1) index is a slice - example 1:4
         # 2) index is a constant - example string, integer
-        assert not isinstance(self.index, Source)
+        if isinstance(self.index, Source):
+            raise AssertionError(
+                f"GetItemSource index must not be a Source, got {type(self.index)}"
+            )
         if self.index_is_slice:
             return f"{{0}}[{_esc_str(self.unpack_slice(), apply_repr=True)}]"
         else:
@@ -697,7 +785,7 @@ class GetItemSource(ChainedSource):
 
 @dataclass_with_cached_hash(frozen=True)
 class ConstDictKeySource(ChainedSource):
-    index: Any
+    index: int
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.add_push_null(
@@ -723,7 +811,10 @@ class NonSerializableSetGetItemSource(ChainedSource):
     def __post_init__(self) -> None:
         from .variables import ConstantVariable
 
-        assert ConstantVariable.is_literal(self.index)
+        if not ConstantVariable.is_literal(self.index):
+            raise AssertionError(
+                f"NonSerializableSetGetItemSource index must be a literal, got {self.index!r}"
+            )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.add_push_null(
@@ -733,10 +824,24 @@ class NonSerializableSetGetItemSource(ChainedSource):
         codegen.append_output(codegen.create_load_const(self.index))
         codegen.extend_output(create_call_function(2, False))
 
+    def get_value(
+        self,
+        globals: dict[str, Any],
+        locals: dict[str, Any],
+        cache: dict[Source, Any],
+    ) -> Any:
+        if self in cache:
+            return cache[self]
+        value = utils.set_getitem(
+            self.base.get_value(globals, locals, cache), self.index
+        )
+        cache[self] = value
+        return value
+
     @functools.cached_property
     def _name_template(self) -> str:
         # set ordering might not be stable
-        return f"list({{0}})[{_esc_str(self.index, apply_repr=True)}]"
+        return f"___set_getitem({{0}}, {_esc_str(self.index, apply_repr=True)})"
 
     def is_dict_key(self) -> bool:
         return False
@@ -748,14 +853,17 @@ class DictGetItemSource(ChainedSource):
     # Key to access in the dictionary. It can be one of the following types
     # 1) ConstDictKeySource
     # 2) constant - like string, integer
-    index: Any
+    index: object
 
     def __post_init__(self) -> None:
         from .variables import ConstantVariable
 
-        assert isinstance(
+        if not isinstance(
             self.index, ConstDictKeySource
-        ) or ConstantVariable.is_literal(self.index)
+        ) and not ConstantVariable.is_literal(self.index):
+            raise AssertionError(
+                f"DictGetItemSource index must be a ConstDictKeySource or literal, got {self.index!r}"
+            )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         # Load dict
@@ -767,6 +875,28 @@ class DictGetItemSource(ChainedSource):
         else:
             codegen.append_output(codegen.create_load_const(self.index))
         codegen.append_output(create_binary_subscr())
+
+    def reconstruct_pycode(self, codegen: "PyCodegen") -> str:
+        base = self.base.reconstruct_pycode(codegen)
+        if isinstance(self.index, ConstDictKeySource):
+            index = self.index.reconstruct_pycode(codegen)
+        else:
+            index = repr(self.index)
+        return f"{base}[{index}]"
+
+    def get_value(
+        self,
+        globals: dict[str, Any],
+        locals: dict[str, Any],
+        cache: dict[Source, Any],
+    ) -> Any:
+        if isinstance(self.index, Source):
+            return super().get_value(globals, locals, cache)
+        if self in cache:
+            return cache[self]
+        value = self.base.get_value(globals, locals, cache)[self.index]
+        cache[self] = value
+        return value
 
     @functools.cached_property
     def _name_template(self) -> str:
@@ -783,14 +913,17 @@ class DictSubclassGetItemSource(ChainedSource):
     # Key to access in the dictionary. It can be one of the following types
     # 1) ConstDictKeySource
     # 2) constant - like string, integer
-    index: Any
+    index: object
 
     def __post_init__(self) -> None:
         from .variables import ConstantVariable
 
-        assert isinstance(
+        if not isinstance(
             self.index, ConstDictKeySource
-        ) or ConstantVariable.is_literal(self.index)
+        ) and not ConstantVariable.is_literal(self.index):
+            raise AssertionError(
+                f"DictSubclassGetItemSource index must be a ConstDictKeySource or literal, got {self.index!r}"
+            )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         # reconstruct dict.__getitem__(dct, key)
@@ -852,7 +985,10 @@ class ListGetItemSource(GetItemSource):
         # Index can be of following types
         # 1) index is a slice - example 1:4
         # 2) index is a constant - example string, integer
-        assert not isinstance(self.index, Source)
+        if isinstance(self.index, Source):
+            raise AssertionError(
+                f"ListGetItemSource index must not be a Source, got {type(self.index)}"
+            )
         if self.index_is_slice:
             raise RuntimeError(
                 "List[slice] is a temporary object and should not have a source"
@@ -906,7 +1042,8 @@ class DataclassFieldsSource(ChainedSource):
 @dataclass_with_cached_hash(frozen=True)
 class TypeSource(ChainedSource):
     def __post_init__(self) -> None:
-        assert self.base is not None
+        if self.base is None:
+            raise AssertionError("TypeSource base must not be None")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.add_push_null(lambda: codegen.load_import_from("builtins", "type"))
@@ -932,6 +1069,9 @@ class OptimizerSource(ChainedSource):
 class NNModuleSource(ChainedSource):
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen(self.base)
+
+    def reconstruct_pycode(self, codegen: "PyCodegen") -> str:
+        return self.base.reconstruct_pycode(codegen)
 
     @functools.cached_property
     def guard_source(self) -> GuardSource:
@@ -975,55 +1115,22 @@ class GlobalStateSource(Source):
 
 
 @dataclass_with_cached_hash(frozen=True)
-class TorchSource(Source):
-    """Points to the actual `torch` module - used instead of GlobalSource
-    in case the user has overridden `torch` in their local namespace"""
+class ImportSource(Source):
+    """Points to an imported module - used instead of GlobalSource
+    in case the user has overridden the module name in their local namespace"""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        from .guards import GuardBuilder, install_guard
+    module_name: str
 
-        install_guard(self.make_guard(GuardBuilder.ID_MATCH))
-
-    @property
+    @functools.cached_property
     def _name_template(self) -> str:
-        return "__import__('torch')"
+        return f"__import__('{self.module_name}')"
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.extend_output(
             [
                 codegen.create_load_const(0),  # level
                 create_build_tuple(0),  # fromlist
-                codegen.create_import_name("torch"),
-            ]
-        )
-
-    @property
-    def guard_source(self) -> GuardSource:
-        return GuardSource.GLOBAL
-
-
-@dataclass_with_cached_hash(frozen=True)
-class CollectionsSource(Source):
-    """Points to the actual `collections` module - used instead of GlobalSource
-    in case the user has overridden `collections` in their local namespace"""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        from .guards import GuardBuilder, install_guard
-
-        install_guard(self.make_guard(GuardBuilder.ID_MATCH))
-
-    @property
-    def _name_template(self) -> str:
-        return "__import__('collections')"
-
-    def reconstruct(self, codegen: "PyCodegen") -> None:
-        codegen.extend_output(
-            [
-                codegen.create_load_const(0),  # level
-                create_build_tuple(0),  # fromlist
-                codegen.create_import_name("collections"),
+                codegen.create_import_name(self.module_name),
             ]
         )
 
@@ -1097,6 +1204,27 @@ class SubclassAttrListSource(ChainedSource):
         return "{0}.__tensor_flatten__()[0]"
 
 
+# Guard-only source that yields the inner tensor of an AsyncCollectiveTensor
+# (ACT) and the base value unchanged for a plain Tensor. Used to guard on the
+# unwrapped tensor so a graph traced on an ACT can be reused when the resolved
+# plain Tensor is passed at runtime. See
+# torch._dynamo.variables.builder.VariableBuilder.wrap_tensor.
+@dataclass_with_cached_hash(frozen=True)
+class UnwrapCollectiveTensorSource(ChainedSource):
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        codegen.add_push_null(
+            lambda: codegen.load_import_from(
+                "torch._dynamo.guards", "unwrap_async_collective_tensor"
+            )
+        )
+        codegen(self.base)
+        codegen.extend_output(create_call_function(1, False))
+
+    @property
+    def _name_template(self) -> str:
+        return "___unwrap_async_collective_tensor({0})"
+
+
 # NB: We don't expect you to actually ever generate guards against this
 # source, it is ephemeral
 @dataclass_with_cached_hash(frozen=True)
@@ -1111,6 +1239,30 @@ class CallMethodItemSource(ChainedSource):
     @property
     def _name_template(self) -> str:
         return "{0}.item()"
+
+
+@dataclass_with_cached_hash(frozen=True)
+class ContextVarGetSource(ChainedSource):
+    has_default: bool = False
+    default_value: object = None
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        def load_get_method():
+            codegen(self.base)
+            codegen.extend_output(codegen.create_load_attrs("get"))
+
+        codegen.add_push_null(load_get_method)
+        if self.has_default:
+            codegen.append_output(codegen.create_load_const(self.default_value))
+            codegen.extend_output(create_call_function(1, False))
+        else:
+            codegen.extend_output(create_call_function(0, False))
+
+    @functools.cached_property
+    def _name_template(self) -> str:
+        if self.has_default:
+            return f"{{0}}.get({_esc_str(self.default_value, apply_repr=True)})"
+        return "{0}.get()"
 
 
 # This is a synthetic source that is associated with the singleton
@@ -1164,9 +1316,10 @@ class BackwardStateSource(Source):
         return GuardSource.BACKWARD_STATE
 
 
+@functools.lru_cache
 def get_local_source_name(
     source: Source, *, only_allow_input: bool = False
-) -> Optional[str]:
+) -> str | None:
     if isinstance(source, ChainedSource):
         return get_local_source_name(source.base, only_allow_input=only_allow_input)
     if not isinstance(source, LocalSource):
@@ -1176,15 +1329,18 @@ def get_local_source_name(
     return source.local_name
 
 
+@functools.lru_cache
 def is_from_local_source(source: Source, *, only_allow_input: bool = False) -> bool:
     return get_local_source_name(source, only_allow_input=only_allow_input) is not None
 
 
+@functools.lru_cache
 def is_from_global_source(source: Source) -> bool:
     return get_global_source_name(source) is not None
 
 
-def get_global_source_name(source: Source) -> Optional[str]:
+@functools.lru_cache
+def get_global_source_name(source: Source | None) -> str | None:
     if isinstance(source, ChainedSource):
         return get_global_source_name(source.base)
     if not isinstance(source, GlobalSource):
@@ -1192,6 +1348,7 @@ def get_global_source_name(source: Source) -> Optional[str]:
     return source.global_name
 
 
+@functools.lru_cache
 def is_from_nonlocal_source(source: Source) -> bool:
     if isinstance(source, ChainedSource):
         return is_from_nonlocal_source(source.base)
@@ -1202,6 +1359,7 @@ def is_from_nonlocal_source(source: Source) -> bool:
     )
 
 
+@functools.lru_cache
 def is_from_closure_source(source: Source) -> bool:
     if isinstance(source, ClosureSource):
         return True
@@ -1210,10 +1368,22 @@ def is_from_closure_source(source: Source) -> bool:
     return False
 
 
+@functools.lru_cache
 def is_from_source(source: Source, target: Source) -> bool:
+    if source == target:
+        return True
     if isinstance(source, ChainedSource):
         return is_from_source(source.base, target)
-    return source == target
+    return False
+
+
+@functools.lru_cache
+def is_from_attr_proxy_source(source: Source) -> bool:
+    if isinstance(source, AttrProxySource):
+        return True
+    if isinstance(source, ChainedSource):
+        return is_from_attr_proxy_source(source.base)
+    return False
 
 
 @functools.lru_cache

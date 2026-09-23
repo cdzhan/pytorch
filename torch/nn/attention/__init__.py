@@ -3,6 +3,7 @@
 
 import contextlib
 from collections.abc import Iterable
+from contextvars import ContextVar
 from typing import Union
 from warnings import warn
 
@@ -23,12 +24,13 @@ __all__: list[str] = [
     "activate_flash_attention_impl",
     "list_flash_attention_impls",
     "current_flash_attention_impl",
+    "restore_flash_attention_impl",
 ]
 
 
 # Note: [SDPA warnings]
 # TODO: Consider using this for sdpa regardless of subclasses
-# This only effects users of bias subclasses
+# This only affects users of bias subclasses
 # If this is set to True, we will warn the user if they are not using the fused kernels
 # As well, it will raise warnings for all the reasons why the fused kernels can't be run.
 # To set this to True, run
@@ -76,6 +78,12 @@ _backend_names = {
     "math": "MATH",
     "overrideable": "OVERRIDEABLE",
 }
+_sdpa_kernel_uses_priority = ContextVar("sdpa_kernel_uses_priority", default=False)
+
+
+def _is_sdp_priority_order_active() -> bool:
+    """Return whether an enclosing sdpa_kernel context set backend priority."""
+    return _sdpa_kernel_uses_priority.get()
 
 
 def _backend_from_string(name: str):
@@ -118,7 +126,7 @@ def sdpa_kernel(backends: list[SDPBackend] | SDPBackend, set_priority: bool = Fa
 
     Args:
         backends (Union[List[SDPBackend], SDPBackend]): A backend or list of backends for scaled dot product attention.
-        set_priority_order (bool=False): Whether the ordering of the backends is interpreted as their priority order.
+        set_priority (bool=False): Whether the ordering of the backends is interpreted as their priority order.
 
     Example:
 
@@ -135,12 +143,19 @@ def sdpa_kernel(backends: list[SDPBackend] | SDPBackend, set_priority: bool = Fa
         with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
             scaled_dot_product_attention(...)
 
+        # Enable the cuDNN or flash attention backends, and in that order
+        with sdpa_kernel(
+            [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION], set_priority=True
+        ):
+            scaled_dot_product_attention(...)
+
     This context manager can be used to select which backend to use for scaled dot product attention.
     Upon exiting the context manager, the previous state of the flags will be restored, enabling all backends.
     """
-    assert isinstance(backends, (list, SDPBackend)), (
-        "Backend must be an instance of SDPBackend or a list of SDPBackend instances"
-    )
+    if not isinstance(backends, (list, SDPBackend)):
+        raise AssertionError(
+            f"Backend must be an instance of SDPBackend or a list of SDPBackend instances, got {type(backends).__name__}"
+        )
 
     if isinstance(backends, SDPBackend):
         backends = [backends]
@@ -148,10 +163,14 @@ def sdpa_kernel(backends: list[SDPBackend] | SDPBackend, set_priority: bool = Fa
     backends = list(dict.fromkeys(backends))
 
     previous_backends = _cur_sdpa_kernel_backends(with_priority=set_priority)
+    priority_token = _sdpa_kernel_uses_priority.set(
+        set_priority or _sdpa_kernel_uses_priority.get()
+    )
     try:
         _sdpa_kernel(backends, set_priority)
         yield {}
     finally:
+        _sdpa_kernel_uses_priority.reset(priority_token)
         _sdpa_kernel(previous_backends, set_priority)
 
 
@@ -177,11 +196,13 @@ register_flash_attention_impl = _registry.register_flash_attention_impl
 activate_flash_attention_impl = _registry.activate_flash_attention_impl
 list_flash_attention_impls = _registry.list_flash_attention_impls
 current_flash_attention_impl = _registry.current_flash_attention_impl
+restore_flash_attention_impl = _registry.restore_flash_attention_impl
 
 register_flash_attention_impl.__module__ = __name__
 activate_flash_attention_impl.__module__ = __name__
 list_flash_attention_impls.__module__ = __name__
 current_flash_attention_impl.__module__ = __name__
+restore_flash_attention_impl.__module__ = __name__
 
 # Import built-in implementations to trigger self-registration
-from . import _fa4  # noqa: F401
+from . import _fa3, _fa4

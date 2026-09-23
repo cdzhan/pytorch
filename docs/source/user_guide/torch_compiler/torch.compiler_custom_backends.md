@@ -81,7 +81,7 @@ Registration serves two purposes:
 
 - You can pass a string containing your backend function's name to `torch.compile` instead of the function itself,
   for example, `torch.compile(model, backend="my_compiler")`.
-- It is required for use with the [minifier](https://pytorch.org/docs/main/torch.compiler_troubleshooting_old.html#minifier). Any generated
+- It is required for use with the [minifier](https://docs.pytorch.org/docs/main/torch.compiler_troubleshooting_old.html#minifier). Any generated
   code from the minifier must call your code that registers your backend function, typically through an `import` statement.
 
 ## Custom Backends after AOTAutograd
@@ -90,7 +90,7 @@ It is possible to define custom backends that are called by AOTAutograd rather t
 This is useful for 2 main reasons:
 
 - Users can define backends that support model training, as AOTAutograd can generate the backward graph for compilation.
-- AOTAutograd produces FX graphs consisting of [core Aten ops](https://pytorch.org/docs/main/torch.compiler_ir.html#core-aten-ir). As a result,
+- AOTAutograd produces FX graphs consisting of [core Aten ops](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_ir.html#core-aten-ir). As a result,
   custom backends only need to support the core Aten opset, which is a significantly smaller opset than the entire torch/Aten opset.
 
 Wrap your backend with
@@ -117,6 +117,60 @@ my_backend = aot_autograd(fw_compiler=my_compiler)  # bw_compiler=my_compiler
 
 model_opt = torch.compile(model, backend=my_backend)
 ```
+
+## Eager Backend Initialization
+
+Backends that need to run eager setup at `torch.compile()` time
+(e.g. loading native libraries or initializing device contexts) can define a
+`_dynamo_backend_init` attribute --- a no-arg callable that fires when the
+backend is resolved, before any invocation.
+
+```python
+def my_backend(gm, example_inputs):
+    return gm.forward
+
+def my_backend_init():
+    load_native_libs()      # runs at compile() time, before any invocation
+
+my_backend._dynamo_backend_init = my_backend_init
+
+@torch.compile(backend=my_backend)
+def fn(x):
+    return x + 1
+```
+
+The hook works whether the backend is passed directly, registered by name
+with `register_backend`, or forced via
+`torch.compiler.set_stance(force_backend=...)`. It is read off the inner
+backend object, so it is found whether it is an instance attribute or a
+class method (resolved via the MRO). When using
+`aot_autograd(fw_compiler=...)`, set the hook on the inner `fw_compiler` ---
+`AotAutograd` reads it at fire time, so it may be set before or after
+`aot_autograd()` is constructed. Only `fw_compiler` is consulted; hooks set
+on `bw_compiler` or `inference_compiler` are ignored.
+
+The hook fires every time the backend is resolved, on both the normal
+and `fullgraph=True` paths, before any invocation, so `torch.compile()`
+fails fast on a broken environment. A backend resolved repeatedly (e.g.
+under `torch.compiler.set_stance(force_backend=...)` or the
+`compiled_autograd` rebuild path) fires once per resolution; backends that
+need one-time setup should deduplicate in the hook itself:
+
+```python
+import functools
+
+@functools.cache  # once per process
+def my_backend_init():
+    load_native_libs()
+
+my_backend._dynamo_backend_init = my_backend_init
+```
+
+If the hook raises, the exception propagates out of `torch.compile()`;
+under `torch.compiler.set_stance(force_backend=...)`, resolution happens
+on the first call, so the hook fires -- and a failure surfaces -- from
+the call instead.
+
 
 ## Examples
 

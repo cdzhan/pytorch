@@ -13,6 +13,7 @@
 
 #define C10_CUDA_CHECK_WO_DSA(EXPR)                                 \
   do {                                                              \
+    c10::cuda::CUDAErrorLogCapture __cuda_error_log;                \
     const cudaError_t __err = EXPR;                                 \
     c10::cuda::c10_cuda_check_implementation(                       \
         static_cast<int32_t>(__err),                                \
@@ -20,7 +21,8 @@
         __func__, /* Line number data type not well-defined between \
                       compilers, so we perform an explicit cast */  \
         static_cast<uint32_t>(__LINE__),                            \
-        false);                                                     \
+        false,                                                      \
+        &__cuda_error_log);                                         \
   } while (0)
 
 namespace c10::cuda {
@@ -62,6 +64,9 @@ int dsa_get_device_count() {
 }
 
 bool dsa_check_if_all_devices_support_managed_memory() {
+#ifdef USE_ROCM
+  return true;
+#else
 // It looks as though this'll work best on CUDA GPUs with Pascal
 // architectures or newer, per
 // https://developer.nvidia.com/blog/unified-memory-cuda-beginners/
@@ -74,6 +79,7 @@ bool dsa_check_if_all_devices_support_managed_memory() {
   return true;
 #else
   return false;
+#endif
 #endif
 }
 
@@ -182,9 +188,9 @@ std::string c10_retrieve_device_side_assertion_info() {
       }
     }
   }
-  return oss.str();
+  return std::move(oss).str();
 #else
-  return "Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n";
+  return "";
 #endif
 }
 
@@ -294,11 +300,16 @@ DeviceAssertionsData* CUDAKernelLaunchRegistry::
   C10_CUDA_CHECK_WO_DSA(
       cudaMallocManaged(&uvm_assertions_ptr, sizeof(DeviceAssertionsData)));
 
-#if CUDART_VERSION >= 13000
-  cudaMemLocation cpuDevice;
-  cpuDevice.type = cudaMemLocationTypeDevice;
-  cpuDevice.id = cudaCpuDeviceId;
+#if CUDART_VERSION >= 13000 && !defined(USE_ROCM)
+  // The CPU is addressed via cudaMemLocationTypeHost; a device location with
+  // id == cudaCpuDeviceId is rejected with cudaErrorInvalidValue, since ids are
+  // only validated as device ordinals. The id field is ignored for host
+  // locations.
+  cudaMemLocation cpuDevice{};
+  cpuDevice.type = cudaMemLocationTypeHost;
 #else
+  // hipMemAdvise_v2 with hipMemLocationTypeDevice + hipCpuDeviceId fails on
+  // ROCm; the v1 int API maps to Host semantics and works.
   const auto cpuDevice = cudaCpuDeviceId;
 #endif
 

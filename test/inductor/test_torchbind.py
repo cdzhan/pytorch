@@ -218,6 +218,7 @@ class TestTorchbind(TestCase):
                                 ],
                                 "metadata": {},
                                 "is_hop_single_tensor_return": None,
+                                "name": None,
                             },
                         },
                         {
@@ -241,13 +242,14 @@ class TestTorchbind(TestCase):
                                         "kind": 1,
                                     },
                                 ],
-                                "outputs": [{"as_tensor": {"name": "buf6"}}],
+                                "outputs": [{"as_tensor": {"name": "buf5"}}],
                                 "metadata": {},
                                 "is_hop_single_tensor_return": None,
+                                "name": None,
                             },
                         },
                         {
-                            "name": "buf7",
+                            "name": "buf6",
                             "node": {
                                 "target": "call_torchbind",
                                 "inputs": [
@@ -272,9 +274,10 @@ class TestTorchbind(TestCase):
                                         "kind": 1,
                                     },
                                 ],
-                                "outputs": [{"as_tensor": {"name": "buf8"}}],
+                                "outputs": [{"as_tensor": {"name": "buf6"}}],
                                 "metadata": {},
                                 "is_hop_single_tensor_return": None,
+                                "name": None,
                             },
                         },
                     ]

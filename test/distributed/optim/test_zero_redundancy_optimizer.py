@@ -32,6 +32,7 @@ from torch.optim import AdamW, SGD
 from torch.testing._internal.common_distributed import (
     DistributedTestBase,
     logger,
+    MultiProcContinuousTest,
     requires_accelerator_dist_backend,
     requires_ddp_rank,
     requires_gloo,
@@ -82,11 +83,28 @@ class TestZeroRedundancyOptimizer(DistributedTestBase):
         return 1
 
 
-class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
+class TestZeroRedundancyOptimizerSingleRank(MultiProcContinuousTest):
+    world_size = 1
+
+    @property
+    def device(self):
+        return device_type
+
+    @classmethod
+    def backend_str(cls):
+        return {"cuda": "nccl", "hpu": "hccl", "xpu": "xccl"}.get(device_type, "gloo")
+
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        if cls.backend_str() in ("nccl", "xccl"):
+            device = torch.device(f"{device_type}:{rank}")
+            torch.set_default_device(device)
+            torch.accelerator.set_device_index(device)
+        super()._init_pg(rank, world_size, rdvz_file)
+
     def test_state_dict(self):
         """Check that ZeroRedundancyOptimizer exposes the expected state dict
         interface, irrespective of the sharding."""
-        self.create_pg(self.device)
         LR1 = 0.1
         LR2 = 0.01
         MOMENTUM = 0.9
@@ -154,7 +172,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_lr_scheduler(self):
         """Check that a normal PyTorch ``lr_scheduler`` is usable with
         ZeroRedundancyOptimizer."""
-        self.create_pg(self.device)
         NUM_ITERS = 5
         LR = 0.01
         x = torch.tensor([1.0], device=self.device, requires_grad=True)
@@ -176,7 +193,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
 
     def test_step_with_kwargs(self):
         """Check that the ``step(**kwargs)`` interface is properly exposed."""
-        self.create_pg(self.device)
         LR = 0.1
 
         class SGDWithStepKWArg(torch.optim.SGD):
@@ -200,7 +216,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         """Check that ZeroRedundancyOptimizer wrapping an optimizer that adds
         extra keys to ``param_groups`` exposes those keys through ZeRO's own
         ``param_groups``."""
-        self.create_pg(self.device)
         LR = 0.1
 
         class SGDWithNewKey(torch.optim.SGD):
@@ -219,7 +234,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_step_without_closure(self):
         """Check that the ``step()`` method (without closure) is handled as
         expected."""
-        self.create_pg(self.device)
         LR = 0.1
 
         class SGDWithoutClosure(torch.optim.SGD):
@@ -238,7 +252,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
 
     def test_zero_grad(self):
         """Check that the ``zero_grad`` method is properly handled."""
-        self.create_pg(self.device)
         LR = 0.01
         x = torch.rand(1)
         m = torch.nn.Linear(1, 1)
@@ -254,7 +267,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
     def test_constructor(self):
         """Check the robustness of the ZeroRedundancyOptimizer constructor by
         passing different values for the ``params`` argument."""
-        self.create_pg(self.device)
         LR = 0.01
         m = torch.nn.Sequential(
             torch.nn.Linear(5, 10),
@@ -304,13 +316,15 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
             betas=BETAS,
             eps=EPS,
         )
-        assert len(o.param_groups) == 2, (
-            f"Expected 2 ZeRO param groups, but got {len(o.param_groups)}"
-        )
-        assert len(o.optim.param_groups) == 2, (
-            "Expected 2 local optimizer param groups, but got "
-            f"{len(o.optim.param_groups)}"
-        )
+        if not (len(o.param_groups) == 2):
+            raise AssertionError(
+                f"Expected 2 ZeRO param groups, but got {len(o.param_groups)}"
+            )
+        if not (len(o.optim.param_groups) == 2):
+            raise AssertionError(
+                "Expected 2 local optimizer param groups, but got "
+                f"{len(o.optim.param_groups)}"
+            )
 
     def test_same_dense_param_type(self):
         """Check that ZeroRedundancyOptimizer raises an exception if the input
@@ -319,7 +333,6 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         NOTE: This test should be removed once support for sparse parameters
         and varying parameter types is added.
         """
-        self.create_pg(self.device)
         LR = 0.01
         inputs = [
             [torch.sparse_coo_tensor(size=(2, 3))],
@@ -722,9 +735,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         LR = 1e-3
         MOMENTUM = 0.99
         REFERENCE_RANK = 0
-        assert REFERENCE_RANK in subgroup_ranks, (
-            "Reference rank must be in the new process group"
-        )
+        if REFERENCE_RANK not in subgroup_ranks:
+            raise AssertionError("Reference rank must be in the new process group")
         loss_fn = torch.nn.L1Loss().to(device)
 
         def check(optimizer):
@@ -812,7 +824,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         elif optimizer_class_str == "SGD":
             optimizer_class = torch.optim.SGD
         else:
-            assert 0, f"Unsupported optimizer class: {optimizer_class_str}"
+            raise AssertionError(f"Unsupported optimizer class: {optimizer_class_str}")
 
         with self.context:
             # Define a base model with a different buffer for each rank
@@ -1033,8 +1045,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 super().__init__()
 
             def join_hook(self, **kwargs):
-                assert "zero_optim" in kwargs
-                assert "grads" in kwargs
+                if "zero_optim" not in kwargs:
+                    raise AssertionError("Expected 'zero_optim' in kwargs")
+                if "grads" not in kwargs:
+                    raise AssertionError("Expected 'grads' in kwargs")
                 zero_optim = kwargs["zero_optim"]
                 grads = kwargs["grads"]
                 return _SetGradsJoinHook(zero_optim, grads)
@@ -1095,7 +1109,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     def _test_zero_model_parallel(self, parameters_as_bucket_view: bool, device: str):
         # Use two processes each with two GPUs
-        assert self.rank < 2
+        if not (self.rank < 2):
+            raise AssertionError(f"Expected rank < 2, got {self.rank}")
         NUM_EPOCHS = 2
         NUM_INPUTS = 4
         LR = 0.01
@@ -1207,7 +1222,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         layers are assigned to different devices."""
         if self.rank >= 2:
             return
-        self.create_pg(self.device, world_size=2)
+        self.create_pg(self.device, world_size=2, backend="nccl-legacy")
         self._test_zero_model_parallel(parameters_as_bucket_view, self.device)
 
     def _test_ddp_zero_overlap(
@@ -1325,6 +1340,17 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                     loss.backward()
 
                 # Run the DDP model with local optimizer
+                # NOTE: The reference model needs the same warmup iterations so
+                # that it has also rebuilt its DDP buckets before the compared
+                # iterations. Otherwise its first compared iteration all-reduces
+                # every gradient as one bucket instead of the rebuilt buckets
+                # used by `ddp_model_overlap`, and a different all-reduce message
+                # layout gives a different floating-point reduction order once
+                # there are more than two ranks.
+                for input in inputs[:num_warmup_inputs]:
+                    output = ddp_model_local(input)
+                    loss = output.sum()
+                    loss.backward()
                 for input in inputs:
                     local_optim.zero_grad()
                     output = ddp_model_local(input)

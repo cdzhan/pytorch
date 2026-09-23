@@ -147,13 +147,14 @@ class PackageImporter(Importer):
 
         self._mangler = PackageMangler()
 
-        # used for reduce deserializaiton
+        # used for reduce deserialization
         self.storage_context: Any = None
         self.last_map_location = None
 
         # used for torch.serialization._load
         self.Unpickler = lambda *args, **kwargs: PackageUnpickler(self, *args, **kwargs)
 
+    # pyrefly: ignore [bad-override]
     def import_module(self, name: str, package=None):
         """Load a module from the package if it hasn't already been loaded, and then return
         the module. Modules are loaded locally
@@ -245,7 +246,10 @@ class PackageImporter(Importer):
             loaded_storages[key] = restore_location(storage, location)
 
         def persistent_load(saved_id):
-            assert isinstance(saved_id, tuple)
+            if not isinstance(saved_id, tuple):
+                raise AssertionError(
+                    f"saved_id must be a tuple, got {type(saved_id).__name__}"
+                )
             typename = _maybe_decode_ascii(saved_id[0])
             data = saved_id[1:]
 
@@ -290,7 +294,7 @@ class PackageImporter(Importer):
 
         @contextmanager
         def set_deserialization_context():
-            # to let reduce_package access deserializaiton context
+            # to let reduce_package access deserialization context
             self.storage_context = storage_context
             self.last_map_location = map_location
             try:
@@ -325,11 +329,11 @@ class PackageImporter(Importer):
         """Returns a file structure representation of package's zipfile.
 
         Args:
-            include (Union[List[str], str]): An optional string e.g. ``"my_package.my_subpackage"``, or optional list of strings
+            include (list[str] | str): An optional string e.g. ``"my_package.my_subpackage"``, or optional list of strings
                 for the names of the files to be included in the zipfile representation. This can also be
                 a glob-style pattern, as described in :meth:`PackageExporter.mock`
 
-            exclude (Union[List[str], str]): An optional pattern that excludes files whose name match the pattern.
+            exclude (list[str] | str): An optional pattern that excludes files whose name match the pattern.
 
         Returns:
             :class:`Directory`
@@ -345,7 +349,7 @@ class PackageImporter(Importer):
         file later on.
 
         Returns:
-            :class:`Optional[str]` a python version e.g. 3.8.9 or None if no version was stored with this package
+            :class:`str | None` a python version e.g. 3.8.9 or None if no version was stored with this package
         """
         python_version_path = ".data/python_version"
         return (
@@ -383,7 +387,10 @@ class PackageImporter(Importer):
         ns["__torch_package__"] = True
 
         # Add this module to our private global registry. It should be unique due to mangling.
-        assert module.__name__ not in _package_imported_modules
+        if module.__name__ in _package_imported_modules:
+            raise AssertionError(
+                f"module {module.__name__} already exists in _package_imported_modules"
+            )
         _package_imported_modules[module.__name__] = module
 
         # preemptively install on the parent to prevent IMPORT_FROM from trying to
@@ -391,10 +398,14 @@ class PackageImporter(Importer):
         self._install_on_parent(parent, name, module)
 
         if filename is not None:
-            assert mangled_filename is not None
+            if mangled_filename is None:
+                raise AssertionError(
+                    "mangled_filename must not be None when filename is set"
+                )
             # preemptively install the source in `linecache` so that stack traces,
             # `inspect`, etc. work.
-            assert filename not in linecache.cache  # type: ignore[attr-defined]
+            if filename in linecache.cache:  # type: ignore[attr-defined]
+                raise AssertionError(f"filename {filename} already in linecache.cache")
             linecache.lazycache(mangled_filename, ns)
 
             code = self._compile_source(filename, mangled_filename)
@@ -473,10 +484,7 @@ class PackageImporter(Importer):
                 return self.modules[name]
             parent_module = self.modules[parent]
 
-            try:
-                parent_module.__path__  # type: ignore[attr-defined]
-
-            except AttributeError:
+            if not hasattr(parent_module, "__path__"):
                 # when we attempt to import a package only containing pybinded files,
                 # the parent directory isn't always a package as defined by python,
                 # so we search if the package is actually there or not before calling the error.
@@ -633,7 +641,10 @@ class PackageImporter(Importer):
 
     def _zipfile_path(self, package, resource=None):
         package = self._get_package(package)
-        assert package.__loader__ is self
+        if package.__loader__ is not self:
+            raise AssertionError(
+                f"package.__loader__ must be self, got {package.__loader__}"
+            )
         name = demangle(package.__name__)
         if resource is not None:
             resource = _normalize_path(resource)
@@ -654,7 +665,10 @@ class PackageImporter(Importer):
                 raise ImportError(
                     f"inconsistent module structure. module {name} is not a package, but has submodules"
                 )
-            assert isinstance(node, _PackageNode)
+            if not isinstance(node, _PackageNode):
+                raise AssertionError(
+                    f"expected _PackageNode, got {type(node).__name__}"
+                )
             cur = node
         return cur
 
@@ -734,7 +748,7 @@ inspect.getfile = _patched_getfile
 class _PackageResourceReader:
     """Private class used to support PackageImporter.get_resource_reader().
 
-    Confirms to the importlib.abc.ResourceReader interface. Allowed to access
+    Conforms to the importlib.abc.ResourceReader interface. Allowed to access
     the innards of PackageImporter.
     """
 

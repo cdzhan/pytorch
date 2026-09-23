@@ -10,7 +10,11 @@ from torch._functorch._activation_checkpointing.knapsack_evaluator import (
     KnapsackEvaluator,
 )
 from torch.fx.graph import Graph
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 class TestGraphInfoProvider(TestCase):
@@ -18,6 +22,8 @@ class TestGraphInfoProvider(TestCase):
     Test class for GraphInfoProvider.
     The test class sets up a small graph example and tests the methods validating the graph building logic.
     """
+
+    hw_classification = HardwareClassification.GENERIC
 
     def setUp(self) -> None:
         super().setUp()
@@ -128,7 +134,7 @@ class TestGraphInfoProvider(TestCase):
         )
 
     def test_recomputable_node_only_graph_with_larger_graph_context(self):
-        recomputable_node_only_graph_with_larger_graph_context = self.graph_info_provider.recomputable_node_only_graph_with_larger_graph_context  # noqa: B950
+        recomputable_node_only_graph_with_larger_graph_context = self.graph_info_provider.recomputable_node_only_graph_with_larger_graph_context
         expected_nodes = self.all_recomputable_banned_nodes
         # node1 does not have an indirect path to node5 because of node2
         # node2 has an indirect path to node5
@@ -191,6 +197,8 @@ class TestKnapsackEvaluator(TestCase):
     Test class for KnapsackEvaluator.
     The test class sets up a small graph example and tests the methods validating the knapsack evaluation logic.
     """
+
+    hw_classification = HardwareClassification.GENERIC
 
     def setUp(self) -> None:
         super().setUp()
@@ -331,7 +339,10 @@ class TestKnapsackEvaluator(TestCase):
 
 
 class TestActivationCheckpointingKnapsack(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
+        super().setUp()
         # (memory, runtime, max_memory, expected_runtime, expected_saved, expected_recomputable)
         self.test_cases = [
             ([2, 3, 2, 4, 1], [1, 2, 1, 3, 2], 5, 5.0, [3, 4], [2, 1, 0]),

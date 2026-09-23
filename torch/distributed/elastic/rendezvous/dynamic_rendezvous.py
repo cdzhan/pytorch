@@ -329,8 +329,8 @@ def _remove_participant_epilogue(
     else:
         if len(state.participants) < settings.min_nodes:
             msg = (
-                f"Number of participants {len(state.participants)}) less than"
-                f"min_nodes {settings.min_nodes}, clearning deadline in state"
+                f"Number of participants {len(state.participants)} less than "
+                f"min_nodes {settings.min_nodes}, clearing deadline in state"
             )
             logger.debug(msg)
             state.deadline = None
@@ -907,7 +907,7 @@ class _RendezvousJoinOp:
             rollback_period = 5  # 5 seconds
 
             # If we still have time to rollback (a short period on top of the
-            # operation deadline), try to remove ourself from the rendezvous.
+            # operation deadline), try to remove ourselves from the rendezvous.
             # It is okay if we can't though as our keep-alive will eventually
             # expire.
             if now <= deadline + rollback_period:
@@ -924,7 +924,7 @@ class _RendezvousJoinOp:
         if state.complete:
             # If we are here, it means we are not part of the rendezvous. In
             # case the rendezvous has capacity for additional participants add
-            # ourself to the wait list for the next round.
+            # ourselves to the wait list for the next round.
             if len(state.participants) < ctx.settings.max_nodes:
                 if ctx.node not in state.wait_list:
                     return _Action.ADD_TO_WAIT_LIST
@@ -1203,9 +1203,12 @@ class DynamicRendezvousHandler(RendezvousHandler):
             )
 
         # This will only be hit when TCPStore sharing is enabled.
-        if self._bootstrap_store_info is None:
-            # To avoid race in get_free_port because we release the port after the call,
-            # we want to create a TCPStore server soon afterwards.
+        # Rebuild bootstrap store info when this is the first rendezvous or
+        # when the node became rank 0 but hasn't created a TCP store server
+        # yet (rank changed between rounds due to elastic membership changes).
+        if self._bootstrap_store_info is None or (
+            rank == 0 and self._shared_tcp_store_server is None
+        ):
             server_port = 0
             if rank == 0:
                 self._shared_tcp_store_server = self._create_tcp_store_server(
@@ -1219,9 +1222,11 @@ class DynamicRendezvousHandler(RendezvousHandler):
                 server_port=server_port,  # For non-0 rank, this is a no-op
             )
 
-        assert self._bootstrap_store_info is not None
+        if self._bootstrap_store_info is None:
+            raise AssertionError
         if rank == 0:
-            assert self._shared_tcp_store_server is not None
+            if self._shared_tcp_store_server is None:
+                raise AssertionError
 
         return RendezvousInfo(
             store,

@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from itertools import chain, repeat
-from typing import NamedTuple, Union
+from typing import NamedTuple
 
 import torch
 import torch.cuda.comm as comm
@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import (
     get_cycles_per_ms,
     instantiate_parametrized_tests,
     IS_JETSON,
+    IS_LINUX,
     IS_REMOTE_GPU,
     IS_SANDCASTLE,
     NoTest,
@@ -32,6 +33,7 @@ from torch.testing._internal.common_utils import (
     serialTest,
     skipCUDANonDefaultStreamIf,
     TEST_CUDA,
+    TEST_CUDA_GRAPH,
     TestCase,
 )
 
@@ -42,7 +44,7 @@ TEST_CUDAMALLOCASYNC = TEST_CUDA and (
 
 if not TEST_CUDA:
     print("CUDA not available, skipping tests", file=sys.stderr)
-    TestCase = NoTest  # noqa: F811
+    TestCase = NoTest
 
 
 class TestCudaMultiGPU(TestCase):
@@ -287,6 +289,7 @@ class TestCudaMultiGPU(TestCase):
         for _ in self._test_memory_stats_generator(self):
             self._check_memory_stat_consistency()
 
+    @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/129860")
     @unittest.skipIf(TEST_CUDAMALLOCASYNC, "temporarily disabled")
     @unittest.skipIf(not TEST_MULTIGPU, "only one GPU detected")
     def test_memory_stats_multigpu(self):
@@ -496,6 +499,35 @@ class TestCudaMultiGPU(TestCase):
             self.assertEqual(x.cuda().get_device(), 0)
             torch.cuda.set_device(1)
         self.assertEqual(x.cuda().get_device(), 0)
+
+    @unittest.skipIf(not TEST_MULTIGPU, "detected only one GPU")
+    @unittest.skipIf(
+        not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
+    )
+    def test_graph_destroy_preserves_current_device(self):
+        # ~CUDAGraph runs when the last reference goes away, on whatever thread drops
+        # it, so it must leave that thread's current device alone. The invariant is
+        # device-generic; the regression it guards is ROCm-only, where the destructor
+        # synchronizes the capture device to let deferred frees finish.
+        torch.cuda.set_device(0)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.device(1):
+            # Capture on an explicit stream of this device. The default capture stream
+            # is a process-wide singleton that may already belong to device 0, which
+            # would move the capture (and so capture_dev_) off this device and leave
+            # the assert below testing nothing.
+            s = torch.cuda.Stream()
+            a = torch.full((8,), 1, device="cuda:1")
+            b = a + 1  # warm up before capture
+            with torch.cuda.graph(g, stream=s):
+                self.assertEqual(torch.cuda.current_device(), 1)
+                b = a + 1
+            g.replay()
+            torch.cuda.synchronize()
+        self.assertEqual(torch.cuda.current_device(), 0)
+        del a, b, g, s
+        gc.collect()
+        self.assertEqual(torch.cuda.current_device(), 0)
 
     @unittest.skipIf(not TEST_MULTIGPU, "detected only one GPU")
     def test_current_stream(self):
@@ -1006,7 +1038,7 @@ class TestCudaMultiGPU(TestCase):
 
     # Verifies that mem_get_info works, including when called for a different device
     def test_mem_get_info(self):
-        def _test(device: Union[str, int, torch.device]):
+        def _test(device: str | int | torch.device):
             # Prevent PyTorch from reusing the allocated memory
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -1055,7 +1087,10 @@ class TestCudaMultiGPU(TestCase):
             except RuntimeError as e:
                 import re
 
-                assert re.match(regex, str(e)), str(e) + "\n does not match: \n" + regex
+                if not re.match(regex, str(e)):
+                    raise AssertionError(
+                        str(e) + "\n does not match: \n" + regex
+                    ) from None
         else:
             # assertRaisesRegex does not pass with Python for Jetson,
             # even though the RuntimeError matches regex using re.match

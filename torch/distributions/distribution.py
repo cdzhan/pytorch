@@ -1,6 +1,5 @@
 # mypy: allow-untyped-defs
 import warnings
-from typing import Optional
 from typing_extensions import deprecated
 
 import torch
@@ -11,6 +10,13 @@ from torch.types import _size
 
 
 __all__ = ["Distribution"]
+
+
+def _all_true_or_runtime_assert(valid: Tensor, error_message: str) -> bool:
+    if torch.compiler.is_exporting():
+        torch._assert_async(torch._is_all_true(valid).cpu(), error_message)
+        return True
+    return bool(torch._is_all_true(valid))
 
 
 class Distribution:
@@ -48,7 +54,7 @@ class Distribution:
         self,
         batch_shape: torch.Size = torch.Size(),
         event_shape: torch.Size = torch.Size(),
-        validate_args: Optional[bool] = None,
+        validate_args: bool | None = None,
     ) -> None:
         self._batch_shape = batch_shape
         self._event_shape = event_shape
@@ -74,7 +80,10 @@ class Distribution:
                     continue  # skip checking lazily-constructed args
                 value = getattr(self, param)
                 valid = constraint.check(value)
-                if not torch._is_all_true(valid):
+                if not _all_true_or_runtime_assert(
+                    valid,
+                    "Expected parameter to satisfy its distribution constraint.",
+                ):
                     raise ValueError(
                         f"Expected parameter {param} "
                         f"({type(value).__name__} of shape {tuple(value.shape)}) "
@@ -101,7 +110,7 @@ class Distribution:
 
         Returns:
             New distribution instance with batch dimensions expanded to
-            `batch_size`.
+            `batch_shape`.
         """
         raise NotImplementedError
 
@@ -130,7 +139,7 @@ class Distribution:
         raise NotImplementedError
 
     @property
-    def support(self) -> Optional[constraints.Constraint]:
+    def support(self) -> constraints.Constraint | None:
         """
         Returns a :class:`~torch.distributions.constraints.Constraint` object
         representing this distribution's support.
@@ -318,9 +327,13 @@ class Distribution:
                 stacklevel=2,
             )
             return
-        assert support is not None
+        if support is None:
+            raise AssertionError("support is unexpectedly None")
         valid = support.check(value)
-        if not torch._is_all_true(valid):
+        if not _all_true_or_runtime_assert(
+            valid,
+            "Expected value argument to be within the support of its distribution.",
+        ):
             raise ValueError(
                 "Expected value argument "
                 f"({type(value).__name__} of shape {tuple(value.shape)}) "
@@ -338,7 +351,7 @@ class Distribution:
         return self.__new__(type(self)) if _instance is None else _instance
 
     def __repr__(self) -> str:
-        param_names = [k for k, _ in self.arg_constraints.items() if k in self.__dict__]
+        param_names = [k for k in self.arg_constraints if k in self.__dict__]
         args_string = ", ".join(
             [
                 f"{p}: {self.__dict__[p] if self.__dict__[p].numel() == 1 else self.__dict__[p].size()}"

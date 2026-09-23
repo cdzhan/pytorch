@@ -18,18 +18,15 @@ inline void call_c10_accelerator_check_implementation(
     const char* function_name,
     uint32_t line_number,
     bool include_device_assertions) {
-#ifdef USE_ROCM
-  c10::hip::c10_hip_check_implementation(
-      err, filename, function_name, line_number, include_device_assertions);
-#else
   c10::cuda::c10_cuda_check_implementation(
       err, filename, function_name, line_number, include_device_assertions);
-#endif
 }
 } // namespace
 
 AOTITorchError torch_get_current_cuda_blas_handle(void** ret_handle) {
   AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    // Internal ATen operations restore the handle's default workspace before
+    // releasing their eager workspace allocations.
     *(cublasHandle_t*)(ret_handle) = at::cuda::getCurrentCUDABlasHandle();
   });
 }

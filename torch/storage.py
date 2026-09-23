@@ -38,6 +38,15 @@ _share_memory_map: dict[int, threading.RLock] = {}
 T = TypeVar("T", bound="_StorageBase | TypedStorage")
 
 
+def _throws_on_data_ptr_access(storage: _StorageBase | TypedStorage) -> _bool:
+    # Whether storage.data_ptr() would raise (e.g. FakeTensor,
+    # FunctionalTensor, or a cudagraph-invalidated storage). Non-throwing
+    # replacement for wrapping data_ptr() in a try/except RuntimeError.
+    return torch._C._storage_throw_on_immutable_data_ptr(
+        storage._cdata
+    ) or torch._C._storage_throw_on_mutable_data_ptr(storage._cdata)
+
+
 class _StorageBase:
     _cdata: Any
     is_sparse: _bool = False
@@ -352,11 +361,11 @@ class _StorageBase:
         """Casts this storage to float8_e4m3fnuz type"""
         return self._to(torch.float8_e4m3fnuz)
 
-    def is_pinned(self, device: str | torch.device = "cuda"):
+    def is_pinned(self, device: DeviceLikeType | None = None):
         r"""Determine whether the CPU storage is already pinned on device.
 
         Args:
-            device (str or torch.device): The device to pin memory on (default: ``'cuda'``).
+            device (str or torch.device): The device to pin memory on (default: ``None``).
                 This argument is discouraged and subject to deprecated.
 
         Returns:
@@ -368,11 +377,11 @@ class _StorageBase:
             .is_pinned(device)
         )
 
-    def pin_memory(self, device: str | torch.device = "cuda"):
+    def pin_memory(self, device: DeviceLikeType | None = None):
         r"""Copy the CPU storage to pinned memory, if it's not already pinned.
 
         Args:
-            device (str or torch.device): The device to pin memory on (default: ``'cuda'``).
+            device (str or torch.device): The device to pin memory on (default: ``None``).
                 This argument is discouraged and subject to deprecated.
 
         Returns:
@@ -392,8 +401,8 @@ class _StorageBase:
         """See :meth:`torch.UntypedStorage.share_memory_`"""
         from torch.multiprocessing import get_sharing_strategy
 
-        if self.device.type in ["cuda", torch._C._get_privateuse1_backend_name()]:
-            pass  # CUDA or PrivateUse1 doesn't use POSIX shared memory
+        if self.device.type not in ("cpu", "meta"):
+            pass  # only CPU uses POSIX shared memory
         elif get_sharing_strategy() == "file_system":
             self._share_filename_cpu_()
         else:
@@ -406,7 +415,7 @@ class _StorageBase:
         from torch.multiprocessing import get_sharing_strategy
 
         device = torch.device(device)
-        if device.type in ["cuda", torch._C._get_privateuse1_backend_name(), "hpu"]:
+        if device.type != "cpu":
             return cls(size, device=device)
         elif get_sharing_strategy() == "file_system":
             return cls._new_using_filename_cpu(size)
@@ -453,7 +462,10 @@ def _share_memory_lock_protected(fn):
             if to_free is not None:
                 # Ensure that the cdata from the storage didn't change and only
                 # the data_ptr did.
-                assert self._cdata == to_free
+                if self._cdata != to_free:
+                    raise AssertionError(
+                        f"storage cdata changed unexpectedly: expected {to_free}, got {self._cdata}"
+                    )
                 with _share_memory_lock:
                     _share_memory_map[to_free].release()
                     del _share_memory_map[to_free]
@@ -549,6 +561,7 @@ def _new_dtypes():
         torch.bits2x4,
         torch.bits4x2,
         torch.complex32,
+        torch.bcomplex32,
         torch.uint16,
         torch.uint32,
         torch.uint64,
@@ -630,7 +643,10 @@ def _get_always_warn_typed_storage_removal():
 
 def _set_always_warn_typed_storage_removal(always_warn):
     global _always_warn_typed_storage_removal
-    assert isinstance(always_warn, bool)
+    if not isinstance(always_warn, bool):
+        raise AssertionError(
+            f"always_warn must be bool, got {type(always_warn).__name__}"
+        )
     _always_warn_typed_storage_removal = always_warn
 
 
@@ -887,7 +903,10 @@ class TypedStorage:
         return self._untyped_storage
 
     def _new_wrapped_storage(self, untyped_storage) -> Self:
-        assert type(untyped_storage) is torch.UntypedStorage
+        if type(untyped_storage) is not torch.UntypedStorage:
+            raise AssertionError(
+                f"expected UntypedStorage, got {type(untyped_storage).__name__}"
+            )
 
         if type(self) is TypedStorage:
             return cast(
@@ -1155,11 +1174,11 @@ class TypedStorage:
         _warn_typed_storage_removal()
         return self._new_wrapped_storage(self._untyped_storage.cpu())
 
-    def is_pinned(self, device: str | torch.device = "cuda"):
+    def is_pinned(self, device: DeviceLikeType | None = None):
         r"""Determine whether the CPU TypedStorage is already pinned on device.
 
         Args:
-            device (str or torch.device): The device to pin memory on (default: ``'cuda'``).
+            device (str or torch.device): The device to pin memory on (default: ``None``).
                 This argument is discouraged and subject to deprecated.
 
         Returns:
@@ -1168,11 +1187,11 @@ class TypedStorage:
         _warn_typed_storage_removal()
         return self._untyped_storage.is_pinned(device)
 
-    def pin_memory(self, device: str | torch.device = "cuda"):
+    def pin_memory(self, device: DeviceLikeType | None = None):
         r"""Copy the CPU TypedStorage to pinned memory, if it's not already pinned.
 
         Args:
-            device (str or torch.device): The device to pin memory on (default: ``'cuda'``).
+            device (str or torch.device): The device to pin memory on (default: ``None``).
                 This argument is discouraged and subject to deprecated.
 
         Returns:

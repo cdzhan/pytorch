@@ -3329,7 +3329,7 @@ void test_masked_fill_scalar(
 
       for (int mask_shape_id = mask_dim - 1; mask_shape_id >= 0;
            --mask_shape_id) {
-        // truncate amsk_shape by the proceeding dimensitions
+        // truncate mask_shape by the proceeding dimensitions
         auto curr_mask_shape =
             mask_shape.slice(mask_shape_id, mask_dim - mask_shape_id);
 
@@ -4473,7 +4473,7 @@ TEST_F(VulkanAPITest, sigmoid_) {
 }
 
 TEST_F(VulkanAPITest, DISABLED_log_softmax_underflow_exception) {
-  // We apply softmax and log in a sequence to the tesnor [20, 0].
+  // We apply softmax and log in a sequence to the tensor [20, 0].
   // The output of softmax on CPU is [1.0000e+00, 2.0612e-09]; while
   // the output on Vulkan is [1, 0] since 2.0612e-09 is smaller than
   // the smallest represetable positive 5.96e−8. We expect to see nan

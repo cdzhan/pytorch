@@ -26,13 +26,12 @@ def _get_module_state(module: nn.Module) -> _State | None:
 
     Given a ``module``, this API finds out if the module is also a ``_State``
     instance or if the module is managed by a composable API. If the module
-    is also a ``_State``, ``module`` will be casted to ``_State` and returned.
+    is also a ``_State``, ``module`` will be casted to ``_State`` and returned.
     If it is managed by a composable API, the corresponding ``_State`` will
     be returned.
     """
     global _module_state_mapping
     if isinstance(module, _State):
-        # pyrefly: ignore [redundant-cast]
         return cast(_State, module)
     else:
         # https://github.com/pytorch/pytorch/issues/107054

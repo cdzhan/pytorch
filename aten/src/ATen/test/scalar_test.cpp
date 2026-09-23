@@ -30,7 +30,7 @@ using namespace at;
 
 template<typename scalar_type>
 struct Foo {
-  static void apply(Tensor a, Tensor b) {
+  static void apply(Tensor a, [[maybe_unused]] Tensor b) {
     scalar_type s = 1;
     std::stringstream ss;
     ss << "hello, dispatch: " << a.toString() << s << '\n';
@@ -181,7 +181,7 @@ TEST(TestScalar, TestFormatting) {
   auto format = [] (Scalar a) {
     std::ostringstream str;
     str << a;
-    return str.str();
+    return std::move(str).str();
   };
   ASSERT_EQ("3", format(Scalar(3)));
   ASSERT_EQ("3.1", format(Scalar(3.1)));

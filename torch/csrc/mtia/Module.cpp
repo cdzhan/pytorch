@@ -179,12 +179,27 @@ void initModule(PyObject* module) {
     return at::detail::getMTIAHooks().deviceCount();
   });
 
+  m.def("_mtia_getDevice", []() {
+    return at::detail::getMTIAHooks().getCurrentDevice();
+  });
+
+  m.def("_mtia_setDevice", [](c10::DeviceIndex device_index) {
+    at::detail::getMTIAHooks().setCurrentDevice(device_index);
+  });
+
   m.def("_mtia_resetPeakMemoryStats", [](c10::DeviceIndex device_index) {
     at::detail::getMTIAHooks().resetPeakMemoryStats(device_index);
   });
 
   m.def("_mtia_graphPoolHandle", []() {
     return at::detail::getMTIAHooks().graphPoolHandle();
+  });
+
+  m.def("_mtia_isCurrentStreamCapturing", []() {
+    if (!torch::utils::is_device_initialized(at::kMTIA)) {
+      return false;
+    }
+    return at::detail::getMTIAHooks().isCurrentStreamCapturing();
   });
 
   py::class_<_MTIAGraph>(m, "_MTIAGraph")

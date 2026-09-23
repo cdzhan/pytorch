@@ -1074,6 +1074,10 @@ TEST(StaticRuntime, NanToNum) {
 }
 
 TEST(StaticRuntime, Stack) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  // See https://github.com/pytorch/pytorch/issues/178522.
+  GTEST_SKIP() << "Skipping StaticRuntime.Stack on AArch64.";
+#endif
   const auto stack_dim = R"JIT(
     def forward(self, a: Tensor, b: Tensor, dim: int):
         inputs = [a]
@@ -2307,6 +2311,10 @@ TEST(StaticRuntime, Append) {
 }
 
 TEST(StaticRuntime, QuantizedLinear) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  // See https://github.com/pytorch/pytorch/issues/178522.
+  GTEST_SKIP() << "Skipping QuantizedLinear on AArch64.";
+#endif
   const std::string quantize_script = R"IR(
     graph(%input: Tensor, %weights: Tensor):
         %scale: float = prim::Constant[value=1.]()
@@ -3386,7 +3394,7 @@ TEST(StaticRuntime, TupleIndex) {
   torch::jit::Module mod("module");
   mod.define(src);
   StaticModule smod(mod);
-  EXPECT_THROW(smod({100, tuple}), std::out_of_range);
+  EXPECT_THROW(smod({100, tuple}), c10::IndexError);
 }
 
 TEST(StaticRuntime, RaiseException) {
@@ -3585,10 +3593,9 @@ TEST(StaticRuntime, IntImplicit_ThrowOnBadInputs) {
   auto graph = getGraphFromIR(src);
   torch::jit::StaticModule smod(graph);
   // Not 0D tensor
-  EXPECT_THROW(smod({at::tensor({1, 2}, at::kInt)}), std::runtime_error);
+  EXPECT_THROW(smod({at::tensor({1, 2}, at::kInt)}), c10::Error);
   // Wrong dtype
-  EXPECT_THROW(
-      smod({at::tensor({1}, at::kFloat).squeeze()}), std::runtime_error);
+  EXPECT_THROW(smod({at::tensor({1}, at::kFloat).squeeze()}), c10::Error);
 }
 
 TEST(StaticRuntime, Select) {

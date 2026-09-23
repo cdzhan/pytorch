@@ -1,9 +1,23 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/core/ivalue.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 
 namespace c10d::symmetric_memory {
+
+// Validates a peer rank used to index the per-peer arrays of buffer/signal
+// pad pointers. An out-of-range rank reads or writes through a wild pointer,
+// or lands past the signal pad in the peer's tensor data.
+inline void check_rank(int rank, int world_size) {
+  TORCH_CHECK(
+      rank >= 0 && rank < world_size,
+      "rank must be in [0, ",
+      world_size,
+      ") (got ",
+      rank,
+      ")");
+}
 
 // SymmetricMemory represents symmetric allocations across a group of devices.
 // The allocations represented by a SymmetricMemory object are accessible by
@@ -16,7 +30,7 @@ namespace c10d::symmetric_memory {
 // identical-sized memory via SymmetricMemoryAllocator::alloc(), then invokes
 // SymmetricMemoryAllocator::rendezvous() on the memory to establish the
 // association across peer buffers. The rendezvous is a one-time process, and
-// the mapping between a local memory memory and the associated SymmetricMemory
+// the mapping between a local memory and the associated SymmetricMemory
 // object is unique.
 //
 // NOTE [symmetric memory signal pad]
@@ -34,8 +48,14 @@ namespace c10d::symmetric_memory {
 // different purposes. Without the concept of channels, we cannot guarantee the
 // correctness of the barriers since signals issued from barrier on stream A
 // can be received by the barrier on stream B. By specifying different channels
-// for these two barriers, they can operate correctly in parallel.
-class TORCH_API SymmetricMemory : public c10::intrusive_ptr_target {
+// for these two barriers, their signals stay separate.
+//
+// NOTE [symmetric memory stream ordering]
+// The built-in operations that touch the signal pad are ordered across CUDA
+// streams per process group by GroupStreamGuard, so different channels do not
+// give them concurrency across streams. User kernels launched on a raw
+// get_signal_pad() tensor are not covered.
+class TORCH_API SymmetricMemory : public torch::CustomClassHolder {
  public:
   ~SymmetricMemory() override = default;
 
@@ -50,9 +70,7 @@ class TORCH_API SymmetricMemory : public c10::intrusive_ptr_target {
   virtual size_t get_buffer_size() = 0;
   size_t get_signal_pad_size();
 
-  virtual size_t get_offset() {
-    TORCH_CHECK(false, "NYI");
-  }
+  virtual size_t get_offset() = 0;
 
   virtual bool has_multicast_support() = 0;
   virtual void* get_multicast_ptr() = 0;
@@ -114,6 +132,9 @@ class SymmetricMemoryAllocator : public c10::intrusive_ptr_target {
   virtual bool has_multicast_support(int device_idx) = 0;
   virtual c10::DeviceType supported_device_type() = 0;
   virtual std::string name() = 0;
+  virtual bool has_allocation(void* ptr) {
+    return false;
+  }
 };
 
 C10_EXPORT bool is_finalizing();
@@ -147,18 +168,18 @@ struct GroupInfo {
   int rank;
   int world_size;
   c10::intrusive_ptr<c10d::Store> store;
-  // Note this field is not automatically populated by set_group_info().  If a
-  // SymmetricMemory implementation needs to use it, it must be populated by a
-  // call to exchange_global_ranks() first.
-  std::vector<int> rank_to_global_rank;
 };
 
 C10_EXPORT GroupInfo& get_group_info(const std::string& group_name);
 
 // Identical to empty_strided, but allows symmetric memory access to be
-// established for the allocated tensor via SymmetricMemory::rendezvous(). This
-// function itself is not a collective operation. It invokes
-// SymmetricMemoryAllocator::alloc() for the requested device under the hood.
+// established for the allocated tensor via SymmetricMemory::rendezvous(). It
+// invokes SymmetricMemoryAllocator::alloc() for the requested device under the
+// hood.
+//
+// Whether this is a collective operation is backend-dependent. The NVSHMEM
+// allocator calls nvshmem_malloc and barriers inside alloc(), so with that
+// backend every rank must call this the same number of times in the same order.
 //
 // NOTE [symmetric memory persistent allocation]
 // If an `alloc_id` is supplied, empty_strided_p2p will perform persistent
@@ -195,6 +216,8 @@ TORCH_API c10::intrusive_ptr<SymmetricMemory> rendezvous(
 TORCH_API bool has_multicast_support(
     c10::DeviceType device_type,
     int device_idx);
+
+TORCH_API bool is_symm_mem_tensor(const at::Tensor& tensor);
 
 TORCH_API void set_backend(const std::string& name);
 

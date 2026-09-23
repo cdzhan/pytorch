@@ -337,7 +337,7 @@ struct GraphFuser {
     // (as a legacy from tensors only)
     WithInsertPoint guard(*subgraph.nodes().begin());
     for (auto input : n->inputs()) {
-      if (inputs_map.count(input) == 0) {
+      if (!inputs_map.contains(input)) {
         if (input->type()->isSubtypeOf(*TensorType::get())) {
           auto in_group = subgraph.insertInput(tensor_insert_idx);
           in_group->setType(input->type());
@@ -359,10 +359,9 @@ struct GraphFuser {
           // the scalar is constant. In those cases we inline the constants
           // directly in the body of the fused group.
           AT_ASSERT(input->node()->kind() == prim::Constant);
-          Node* in_const =
-              subgraph.createClone(input->node(), [](Value*) -> Value* {
-                throw std::runtime_error("unexpected input");
-              });
+          Node* in_const = subgraph.createClone(
+              input->node(),
+              [](Value*) -> Value* { TORCH_CHECK(false, "unexpected input"); });
           subgraph.insertNode(in_const);
           inputs_map[input] = in_const->output();
         }
@@ -1013,7 +1012,7 @@ struct GraphFuser {
     for (int64_t i = static_cast<int64_t>(outputs.size()) - 1; i >= 0; --i) {
       auto output = outputs[i];
       auto soutput = soutputs[i];
-      if (usedOnlyInSize(output) && shape_of.count(soutput) > 0) {
+      if (usedOnlyInSize(output) && shape_of.contains(soutput)) {
         auto uses = output->uses();
         for (Use u : uses) {
           AT_ASSERT(u.user->matches("aten::size(Tensor self) -> int[]"));

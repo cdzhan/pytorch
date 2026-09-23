@@ -2,9 +2,7 @@
 
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/Context.h>
-#include <ATen/DeviceGuard.h>
 #include <ATen/DynamicLibrary.h>
-#include <ATen/core/Vitals.h>
 #include <ATen/cuda/CUDAConfig.h>
 #include <ATen/cuda/CUDADevice.h>
 #include <ATen/cuda/Exceptions.h>
@@ -14,13 +12,10 @@
 #include <ATen/detail/CUDAHooksInterface.h>
 #include <ATen/native/cuda/CuFFTPlanCache.h>
 #include <c10/util/Exception.h>
-#include <c10/util/env.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
-#include <c10/util/irange.h>
 
 #if AT_CUDNN_ENABLED()
-#include <ATen/cudnn/cudnn-wrapper.h>
 #include <cudnn_frontend.h>
 #endif
 
@@ -30,6 +25,7 @@
 
 #if defined(USE_ROCM)
 #include <miopen/version.h>
+#include <hipblaslt/hipblaslt-version.h>
 #endif
 
 #ifndef USE_ROCM
@@ -85,9 +81,6 @@ struct _Initializer {
 // let's not if we don't need to!)
 void CUDAHooks::init() const {
   C10_LOG_API_USAGE_ONCE("aten.init.cuda");
-  // Force the update to enable unit testing. This code get executed before unit tests
-  // have a chance to enable vitals.
-  at::vitals::VitalsAPI.setVital("CUDA", "used", "true", /* force = */ true);
 
   const auto num_devices = c10::cuda::device_count_ensure_non_zero();
   c10::cuda::CUDACachingAllocator::init(num_devices);
@@ -381,6 +374,16 @@ long CUDAHooks::versionMIOpen() const {
 #endif
 }
 
+long CUDAHooks::versionHipBLASLt() const {
+#if AT_ROCM_ENABLED()
+  return HIPBLASLT_VERSION_MAJOR * 10000 +
+         HIPBLASLT_VERSION_MINOR * 100 +
+         HIPBLASLT_VERSION_PATCH;
+#else
+  TORCH_CHECK(false, "Cannot query HipBLASLt version if ATen_cuda is not built with ROCm");
+#endif
+}
+
 long CUDAHooks::versionCUDART() const {
 #ifdef CUDART_VERSION
   return CUDART_VERSION;
@@ -478,7 +481,7 @@ std::string CUDAHooks::showConfig() const {
   oss << "  - Magma " << MAGMA_VERSION_MAJOR << '.' << MAGMA_VERSION_MINOR << '.' << MAGMA_VERSION_MICRO << '\n';
 #endif
 
-  return oss.str();
+  return std::move(oss).str();
 }
 
 double CUDAHooks::batchnormMinEpsilonCuDNN() const {
@@ -538,6 +541,41 @@ bool CUDAHooks::isGPUArch(const std::vector<std::string>& archs, DeviceIndex dev
       }
   }
   return false;
+}
+
+const std::vector<std::string>& CUDAHooks::getHipblasltPreferredArchs() const {
+  static const std::vector<std::string> archs = {
+    "gfx90a", "gfx942",
+#if ROCM_VERSION >= 60400
+    "gfx1200", "gfx1201",
+#endif
+#if ROCM_VERSION >= 70000
+    "gfx950",
+#endif
+#if ROCM_VERSION >= 71300
+    "gfx1100", "gfx1101", "gfx1151",
+#endif
+#if ROCM_VERSION >= 71400
+    "gfx1250",
+#endif
+  };
+  return archs;
+}
+
+const std::vector<std::string>& CUDAHooks::getHipblasltSupportedArchs() const {
+  static const std::vector<std::string> archs = {
+    "gfx90a", "gfx942",
+#if ROCM_VERSION >= 60300
+    "gfx1100", "gfx1101", "gfx1103", "gfx1200", "gfx1201", "gfx908",
+#endif
+#if ROCM_VERSION >= 70000
+    "gfx950", "gfx1150", "gfx1151",
+#endif
+#if ROCM_VERSION >= 71400
+    "gfx1250"
+#endif
+  };
+  return archs;
 }
 #endif
 
